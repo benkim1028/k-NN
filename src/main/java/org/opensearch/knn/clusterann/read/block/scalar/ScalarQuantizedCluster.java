@@ -10,6 +10,7 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.RamUsageEstimator;
+import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.apache.lucene.util.IOSupplier;
 import org.apache.lucene.util.quantization.OptimizedScalarQuantizer;
 import org.opensearch.knn.clusterann.read.Centroid;
@@ -143,6 +144,12 @@ public class ScalarQuantizedCluster implements Cluster {
         return new BlockPostingScorer(scorer, ordinals, acceptedOrds);
     }
 
+    @Override
+    public PostingScorer exactScorer(RandomVectorScorer scorer, Bits acceptedOrds) throws IOException {
+        loadOrdinals();
+        return new ExactPostingScorer(ordinals, acceptedOrds, scorer);
+    }
+
     /**
      * Quantize the query into the space this cluster's codes live in: centred on <em>this</em> centroid, at the
      * query width, and transposed into bit planes so the dot product can read a plane at a time.
@@ -219,6 +226,11 @@ public class ScalarQuantizedCluster implements Cluster {
      * place this class does IO.
      */
     private void load() throws IOException {
+        loadOrdinals();
+        centroid = centroid();
+    }
+
+    private void loadOrdinals() throws IOException {
         if (ordinals != null) {
             return;
         }
@@ -227,9 +239,48 @@ public class ScalarQuantizedCluster implements Cluster {
         int[] readOrdinals = new int[clusterSize];
         posting.readInts(readOrdinals, 0, clusterSize);
 
-        centroid = centroid();
-
         // Assigned last: it is the flag that says the rest is ready, so a failed read leaves nothing half-loaded.
         ordinals = readOrdinals;
+    }
+
+    private static final class ExactPostingScorer implements PostingScorer {
+
+        private final int[] ordinals;
+        private final Bits acceptedOrds;
+        private final RandomVectorScorer scorer;
+
+        private int position = -1;
+        private float score;
+
+        private ExactPostingScorer(int[] ordinals, Bits acceptedOrds, RandomVectorScorer scorer) {
+            this.ordinals = ordinals;
+            this.acceptedOrds = acceptedOrds;
+            this.scorer = scorer;
+        }
+
+        @Override
+        public boolean advance(float minCompetitiveSimilarity) throws IOException {
+            while (++position < ordinals.length) {
+                int ord = ordinals[position];
+                if (acceptedOrds != null && acceptedOrds.get(ord) == false) {
+                    continue;
+                }
+                score = scorer.score(ord);
+                if (score >= minCompetitiveSimilarity) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public int ord() {
+            return ordinals[position];
+        }
+
+        @Override
+        public float score() {
+            return score;
+        }
     }
 }

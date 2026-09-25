@@ -259,15 +259,21 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
         final boolean selectiveFilter = acceptedDocBits != null && filterCost < numVectors;
         final FixedBitSet acceptedOrdinals = selectiveFilter ? buildAcceptedOrdinals(acceptedDocBits, ordToDoc, numVectors) : null;
         final Bits acceptedOrds = acceptedOrdinals != null ? acceptedOrdinals : buildAcceptedOrds(acceptedDocBits, ordToDoc, numVectors);
+        final RandomVectorScorer exactScorer = selectiveFilter ? rawFlatVectorsReader.getRandomVectorScorer(fieldName, query) : null;
 
-        if (useExactFilterRoute(acceptedDocBits, filterCost, numVectors, fieldClusters.clusterMeta().dimension())) {
-            exactSearch(fieldName, query, translatedKnnCollector, acceptedOrds, numVectors);
+        if (selectiveFilter && exactScorer == null) {
             return;
         }
 
+        if (useExactFilterRoute(acceptedDocBits, filterCost, numVectors, fieldClusters.clusterMeta().dimension())) {
+            exactSearch(translatedKnnCollector, acceptedOrds, numVectors, exactScorer);
+            return;
+        }
+
+        final Clusters.CentroidMatches centroidMatches;
         final int[] probes;
         if (acceptedOrdinals != null) {
-            final Clusters.CentroidMatches centroidMatches = fieldClusters.centroidMatches(acceptedOrdinals);
+            centroidMatches = fieldClusters.centroidMatches(acceptedOrdinals);
             probes = CentroidPlanner.plan(
                 fieldClusters,
                 query,
@@ -276,11 +282,25 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                 centroidMatches.matchCounts()
             );
         } else {
+            centroidMatches = null;
             probes = CentroidPlanner.plan(fieldClusters, query, PlanParams.of(fieldClusters.numClusters()));
         }
 
         float[] scanQuery = new float[query.length];
         fieldClusters.rotation().rotate(query, scanQuery);
+
+        if (acceptedOrdinals != null) {
+            ClusterSearcher.searchFiltered(
+                fieldClusters,
+                probes,
+                ScanParams.of(scanQuery),
+                translatedKnnCollector,
+                acceptedOrds,
+                centroidMatches.matchCounts(),
+                exactScorer
+            );
+            return;
+        }
 
         ClusterSearcher.search(fieldClusters, probes, ScanParams.of(scanQuery), translatedKnnCollector, acceptedOrds);
     }
@@ -289,14 +309,8 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
         return acceptedDocBits != null && filterCost < numVectors && ((long) filterCost * dimension) <= EXACT_FILTER_THRESHOLD;
     }
 
-    private void exactSearch(String fieldName, float[] query, KnnCollector collector, Bits acceptedOrds, int numVectors)
-        throws IOException {
+    private void exactSearch(KnnCollector collector, Bits acceptedOrds, int numVectors, RandomVectorScorer exactScorer) throws IOException {
         if (acceptedOrds == null) {
-            return;
-        }
-
-        final RandomVectorScorer exactScorer = rawFlatVectorsReader.getRandomVectorScorer(fieldName, query);
-        if (exactScorer == null) {
             return;
         }
 
