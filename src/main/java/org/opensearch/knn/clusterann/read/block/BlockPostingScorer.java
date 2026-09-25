@@ -81,6 +81,9 @@ public class BlockPostingScorer implements PostingScorer {
             int wantedInBlock = validPos(postingVectorOffset, vectorCount);
             if (wantedInBlock != 0) {
                 reader.fetchBlock();
+                if (scorer.canSkipBlock(validPos, minCompetitiveSimilarity)) {
+                    continue;
+                }
                 reader.readBlockVectors();
                 // Counted here because here is where it becomes true: this block was read, and its accepted positions
                 // are about to be scored whether or not any of them ends up competitive.

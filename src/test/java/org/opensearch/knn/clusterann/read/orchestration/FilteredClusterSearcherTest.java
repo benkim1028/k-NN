@@ -30,7 +30,7 @@ class FilteredClusterSearcherTest {
     @Test
     void testSearchFiltered_whenClusterMatchesAreBelowK_thenUsesExactScoring() throws IOException {
         FakeCluster cluster = new FakeCluster(0, new int[] { 10, 11 }, new float[] { 0.2f, 0.1f });
-        FakeClusterSource source = new FakeClusterSource(Map.of(0, cluster), 32);
+        FakeClusterSource source = new FakeClusterSource(Map.of(0, cluster), 4);
         FixedBitSet accepted = accepted(10, 11);
         RecordingCollector collector = new RecordingCollector(2, Float.NEGATIVE_INFINITY);
 
@@ -54,7 +54,7 @@ class FilteredClusterSearcherTest {
     void testSearchFiltered_whenDocsScoredReachThreeKWithThreshold_thenStopsBeforeLaterClusters() throws IOException {
         FakeCluster first = new FakeCluster(0, new int[] { 10, 11, 12 }, new float[] { 0.9f, 0.8f, 0.7f });
         FakeCluster second = new FakeCluster(1, new int[] { 20 }, new float[] { 0.6f });
-        FakeClusterSource source = new FakeClusterSource(Map.of(0, first, 1, second), 32);
+        FakeClusterSource source = new FakeClusterSource(Map.of(0, first, 1, second), 4);
 
         int scanned = ClusterSearcher.searchFiltered(
             source,
@@ -69,6 +69,28 @@ class FilteredClusterSearcherTest {
         assertEquals(1, scanned);
         assertEquals(1, first.adcCalls);
         assertEquals(0, second.adcCalls);
+    }
+
+    @Test
+    void testSearchFiltered_whenSelectivityMakesAClusterTooSparse_thenSkipsIt() throws IOException {
+        FakeCluster sparse = new FakeCluster(0, new int[] { 10 }, new float[] { 0.9f });
+        FakeCluster dense = new FakeCluster(1, new int[] { 20, 21, 22, 23, 24 }, new float[] { 0.8f, 0.7f, 0.6f, 0.5f, 0.4f });
+        FakeClusterSource source = new FakeClusterSource(Map.of(0, sparse, 1, dense), 10);
+
+        int scanned = ClusterSearcher.searchFiltered(
+            source,
+            new int[] { 0, 1 },
+            ScanParams.of(QUERY),
+            new RecordingCollector(2, Float.NEGATIVE_INFINITY),
+            accepted(10, 20),
+            new int[] { 2, 5 },
+            new MapRandomVectorScorer(Map.of())
+        );
+
+        assertEquals(1, scanned);
+        assertEquals(0, sparse.adcCalls);
+        assertEquals(0, sparse.exactCalls);
+        assertEquals(1, dense.adcCalls);
     }
 
     @Test
