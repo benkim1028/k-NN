@@ -7,6 +7,7 @@ package org.opensearch.knn.clusterann.read;
 
 import org.apache.lucene.util.Accountable;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.opensearch.knn.clusterann.read.orchestration.ScanContext;
 
 import java.io.IOException;
@@ -48,6 +49,13 @@ public interface Cluster extends Accountable {
      * @param acceptedOrds ordinals to score, or {@code null} for all; honoured before scoring, not after.
      */
     PostingScorer scorer(ScanContext scanContext, Bits acceptedOrds) throws IOException;
+
+    /**
+     * A full-precision scorer over this cluster's ordinals, using the segment-level exact scorer.
+     *
+     * <p>Used only on filtered paths that choose exact scoring for a sparse matching cluster.
+     */
+    PostingScorer exactScorer(RandomVectorScorer scorer, Bits acceptedOrds) throws IOException;
 
     /**
      * Turn a query into the form this cluster scores against.
