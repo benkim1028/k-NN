@@ -21,8 +21,12 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.InOrder;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
 import org.opensearch.knn.clusterann.format.ClusterANNFormatConstants;
+import org.opensearch.knn.clusterann.format.rotation.RotationFormats;
 import org.opensearch.knn.clusterann.read.orchestration.ClusterScan;
 import org.opensearch.knn.clusterann.read.orchestration.ScanContext;
+import org.opensearch.knn.clusterann.write.CentroidsWriter;
+import org.opensearch.knn.clusterann.write.CentroidsWriter.CentroidData;
+import org.opensearch.knn.clusterann.write.CentroidsWriter.CentroidOffsets;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -162,6 +166,32 @@ class ClustersTests {
         assertTrue(clusters.get(0).size() > 0);
     }
 
+    @Test
+    void testCentroidMatches_thenCountsAcceptedOrdinalsPerCentroidFromRegion1() throws IOException {
+        // given
+        int[] ordToCentroid = { 0, 1, 2, 1, 0, 2, 2, 1, 0, 2, 1, 0, 0, 1, 2, 2, 1, 0, 1 };
+        FixedBitSet acceptedOrds = new FixedBitSet(VECTOR_COUNT);
+        acceptedOrds.set(1);
+        acceptedOrds.set(2);
+        acceptedOrds.set(3);
+        acceptedOrds.set(4);
+        acceptedOrds.set(6);
+        acceptedOrds.set(12);
+        acceptedOrds.set(14);
+
+        // when
+        Clusters.CentroidMatches matches = clustersWithAssignments(ordToCentroid).centroidMatches(acceptedOrds);
+
+        // then
+        assertEquals(2, matches.matchCounts()[0]);
+        assertEquals(2, matches.matchCounts()[1]);
+        assertEquals(3, matches.matchCounts()[2]);
+        assertTrue(matches.acceptedCentroids().get(0));
+        assertTrue(matches.acceptedCentroids().get(1));
+        assertTrue(matches.acceptedCentroids().get(2));
+        assertEquals(3, matches.acceptedCentroids().cardinality());
+    }
+
     // ---------------------------------------------------------------- scan
 
     /**
@@ -250,19 +280,56 @@ class ClustersTests {
     // ---------------------------------------------------------------- helpers
 
     private Clusters clusters(VectorSimilarityFunction similarity) throws IOException {
-        return clusters(similarity, open("clac", 4096));
+        return clusters(similarity, open("clac", 4096), fieldMeta(similarity));
     }
 
     private Clusters clusters(VectorSimilarityFunction similarity, IndexInput centroids) throws IOException {
+        return clusters(similarity, centroids, fieldMeta(similarity));
+    }
+
+    private Clusters clusters(VectorSimilarityFunction similarity, IndexInput centroids, ClusterANNFieldMeta fieldMeta) throws IOException {
         // The inputs are the field's own regions, cut at clapOffset and clacOffset, as the reader hands them over.
-        return new Clusters(open("clap", 3000), centroids, null, fieldMeta(similarity));
+        return new Clusters(open("clap", 3000), centroids, null, fieldMeta);
+    }
+
+    private Clusters clustersWithAssignments(int[] ordToCentroid) throws IOException {
+        ClacFixture fixture = clacWithAssignments(ordToCentroid);
+        return clusters(
+            VectorSimilarityFunction.EUCLIDEAN,
+            fixture.input(),
+            fieldMeta(VectorSimilarityFunction.EUCLIDEAN, ordToCentroid.length, fixture.length(), fixture.offsets().clacCentroidsOffset())
+        );
+    }
+
+    private ClacFixture clacWithAssignments(int[] ordToCentroid) throws IOException {
+        Directory directory = new ByteBuffersDirectory();
+        directories.add(directory);
+        CentroidOffsets offsets;
+        try (IndexOutput out = directory.createOutput("clac", IOContext.DEFAULT)) {
+            offsets = CentroidsWriter.write(
+                out,
+                new CentroidData(ordToCentroid, new float[CENTROID_COUNT][DIMENSION]),
+                RotationFormats.create(ClusterANNFormatConstants.ROTATION_NONE, DIMENSION)
+            );
+        }
+        IndexInput input = directory.openInput("clac", IOContext.DEFAULT);
+        return new ClacFixture(input, input.length(), offsets);
     }
 
     private static ClusterANNFieldMeta fieldMeta(VectorSimilarityFunction similarity) throws IOException {
+        return fieldMeta(similarity, VECTOR_COUNT, 4096L, 64L);
+    }
+
+    private static ClusterANNFieldMeta fieldMeta(
+        VectorSimilarityFunction similarity,
+        int vectorCount,
+        long clacLength,
+        long clacCentroidsOffset
+    ) throws IOException {
         return new ClusterANNFieldMeta(
             BLOCK_SIZE,
             DIMENSION,
-            VECTOR_COUNT,
+            vectorCount,
             CENTROID_COUNT,
             similarity,
             1,                                      // docBits, one bit per dimension
@@ -270,8 +337,8 @@ class ClustersTests {
             ClusterANNFormatConstants.QUANTIZER_OPTIMIZED_SQ,
             new byte[0],
             0L,                                     // clacOffset
-            4096L,                                  // clacLength
-            64L,                                    // clacCentroidsOffset
+            clacLength,
+            clacCentroidsOffset,
             -1L,        // clacRotatedCentroidsOffset
             CLAP_OFFSET,
             3000L,                                  // clapLength
@@ -281,7 +348,7 @@ class ClustersTests {
             -1L,         // clarLength
             -1L,
             // Dense: the fields under test have a vector per document, so the ordinal is the document id.
-            ClusterANNFieldMetaEncoder.denseOrdToDoc(VECTOR_COUNT)
+            ClusterANNFieldMetaEncoder.denseOrdToDoc(vectorCount)
         );
     }
 
@@ -296,6 +363,9 @@ class ClustersTests {
 
     private CountingInput countingInput(String name, int bytes) throws IOException {
         return new CountingInput(open(name, bytes), new int[1]);
+    }
+
+    private record ClacFixture(IndexInput input, long length, CentroidOffsets offsets) {
     }
 
     /** Counts reads, so "get() reads nothing" is asserted rather than assumed. Clones share the counter. */
