@@ -6,6 +6,8 @@
 package org.opensearch.knn.clusterann.read.orchestration;
 
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.hnsw.NeighborQueue;
 import org.opensearch.knn.clusterann.read.CentroidVectorValues;
@@ -55,6 +57,36 @@ public final class CentroidPlanner {
         final NeighborQueue nearest = new NeighborQueue(params.maxProbes(), true);
         for (int ordinal = 0; ordinal < numClusters; ordinal++) {
             if (clusters.clusterSize(ordinal) != 0) {
+                final float[] centroid = centroids.vectorValue(ordinal);
+                nearest.insertWithOverflow(ordinal, distanceKey(similarity, query, queryNormSq, centroid, centroids));
+            }
+        }
+        return closestFirst(nearest);
+    }
+
+    /** Rank only the centroids the filter reaches, using the same plain distance key as unfiltered planning. */
+    public static int[] plan(Clusters clusters, float[] query, PlanParams params, FixedBitSet acceptedCentroids, int[] matchCounts)
+        throws IOException {
+        if (acceptedCentroids == null || matchCounts == null) {
+            throw new IllegalArgumentException("acceptedCentroids and matchCounts must be non-null");
+        }
+
+        int numClusters = clusters.numClusters();
+        if (numClusters == 0 || acceptedCentroids.cardinality() == 0) {
+            return NO_PROBES;
+        }
+        if (matchCounts.length < numClusters) {
+            throw new IllegalArgumentException("matchCounts must cover every cluster");
+        }
+
+        final VectorSimilarityFunction similarity = clusters.clusterMeta().similarityFunction();
+        final CentroidVectorValues centroids = clusters.centroids();
+        float queryNormSq = similarity == VectorSimilarityFunction.EUCLIDEAN ? VectorUtil.dotProduct(query, query) : 0f;
+
+        final NeighborQueue nearest = new NeighborQueue(params.maxProbes(), true);
+        for (int ordinal = acceptedCentroids.nextSetBit(0); ordinal != DocIdSetIterator.NO_MORE_DOCS && ordinal < numClusters; ordinal =
+            acceptedCentroids.nextSetBit(ordinal + 1)) {
+            if (clusters.clusterSize(ordinal) != 0 && matchCounts[ordinal] > 0) {
                 final float[] centroid = centroids.vectorValue(ordinal);
                 nearest.insertWithOverflow(ordinal, distanceKey(similarity, query, queryNormSq, centroid, centroids));
             }
