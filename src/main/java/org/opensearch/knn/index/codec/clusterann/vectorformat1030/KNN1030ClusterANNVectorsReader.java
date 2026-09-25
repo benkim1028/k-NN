@@ -23,6 +23,7 @@ import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.hnsw.OrdinalTranslatedKnnCollector;
@@ -255,14 +256,28 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
             knnCollector,
             (ord) -> Math.toIntExact(ordToDoc.get(ord))
         );
-        final Bits acceptedOrds = buildAcceptedOrds(acceptedDocBits, ordToDoc, numVectors);
+        final boolean selectiveFilter = acceptedDocBits != null && filterCost < numVectors;
+        final FixedBitSet acceptedOrdinals = selectiveFilter ? buildAcceptedOrdinals(acceptedDocBits, ordToDoc, numVectors) : null;
+        final Bits acceptedOrds = acceptedOrdinals != null ? acceptedOrdinals : buildAcceptedOrds(acceptedDocBits, ordToDoc, numVectors);
 
         if (useExactFilterRoute(acceptedDocBits, filterCost, numVectors, fieldClusters.clusterMeta().dimension())) {
             exactSearch(fieldName, query, translatedKnnCollector, acceptedOrds, numVectors);
             return;
         }
 
-        int[] probes = CentroidPlanner.plan(fieldClusters, query, PlanParams.of(fieldClusters.numClusters()));
+        final int[] probes;
+        if (acceptedOrdinals != null) {
+            final Clusters.CentroidMatches centroidMatches = fieldClusters.centroidMatches(acceptedOrdinals);
+            probes = CentroidPlanner.plan(
+                fieldClusters,
+                query,
+                PlanParams.of(fieldClusters.numClusters()),
+                centroidMatches.acceptedCentroids(),
+                centroidMatches.matchCounts()
+            );
+        } else {
+            probes = CentroidPlanner.plan(fieldClusters, query, PlanParams.of(fieldClusters.numClusters()));
+        }
 
         float[] scanQuery = new float[query.length];
         fieldClusters.rotation().rotate(query, scanQuery);
@@ -292,6 +307,16 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                 collector.collect(ord, exactScorer.score(ord));
             }
         }
+    }
+
+    private FixedBitSet buildAcceptedOrdinals(Bits docBits, LongValues ordToDoc, int numVectors) {
+        final FixedBitSet acceptedOrds = new FixedBitSet(numVectors);
+        for (int ord = 0; ord < numVectors; ord++) {
+            if (docBits.get((int) ordToDoc.get(ord))) {
+                acceptedOrds.set(ord);
+            }
+        }
+        return acceptedOrds;
     }
 
     private Bits buildAcceptedOrds(Bits docBits, LongValues ordToDoc, int numVectors) {

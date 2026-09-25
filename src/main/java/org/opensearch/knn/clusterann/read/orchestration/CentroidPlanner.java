@@ -6,6 +6,8 @@
 package org.opensearch.knn.clusterann.read.orchestration;
 
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.hnsw.NeighborQueue;
 import org.opensearch.knn.clusterann.read.CentroidVectorValues;
@@ -63,6 +65,42 @@ public final class CentroidPlanner {
     }
 
     /**
+     * Rank only the centroids the filter reaches, weighted by how many accepted ordinals land in each one.
+     *
+     * <p>Zero-match centroids never take a probe slot, and the remaining ones are ordered by the POC's
+     * {@code distance / log1p(matchCount)} key.
+     */
+    public static int[] plan(Clusters clusters, float[] query, PlanParams params, FixedBitSet acceptedCentroids, int[] matchCounts)
+        throws IOException {
+        if (acceptedCentroids == null || matchCounts == null) {
+            throw new IllegalArgumentException("acceptedCentroids and matchCounts must be non-null");
+        }
+
+        int numClusters = clusters.numClusters();
+        if (numClusters == 0 || acceptedCentroids.cardinality() == 0) {
+            return NO_PROBES;
+        }
+        if (matchCounts.length < numClusters) {
+            throw new IllegalArgumentException("matchCounts must cover every cluster");
+        }
+
+        final VectorSimilarityFunction similarity = clusters.clusterMeta().similarityFunction();
+        final CentroidVectorValues centroids = clusters.centroids();
+        float queryNormSq = similarity == VectorSimilarityFunction.EUCLIDEAN ? VectorUtil.dotProduct(query, query) : 0f;
+
+        final NeighborQueue nearest = new NeighborQueue(params.maxProbes(), true);
+        for (int ordinal = acceptedCentroids.nextSetBit(0); ordinal != DocIdSetIterator.NO_MORE_DOCS && ordinal < numClusters; ordinal =
+            acceptedCentroids.nextSetBit(ordinal + 1)) {
+            if (clusters.clusterSize(ordinal) != 0 && matchCounts[ordinal] > 0) {
+                final float[] centroid = centroids.vectorValue(ordinal);
+                final float distance = distanceKey(similarity, query, queryNormSq, centroid, centroids);
+                nearest.insertWithOverflow(ordinal, densityWeightedDistance(distance, matchCounts[ordinal]));
+            }
+        }
+        return closestFirst(nearest);
+    }
+
+    /**
      * Distance-like key from the query to a centroid, smaller meaning closer. Only EUCLIDEAN is a true distance:
      *
      * <ul>
@@ -85,6 +123,10 @@ public final class CentroidPlanner {
             case DOT_PRODUCT -> throw new IllegalStateException("ClusterANN does not support DOT_PRODUCT; use MAXIMUM_INNER_PRODUCT");
             case COSINE -> -dot / (float) Math.sqrt(centroids.norm());
         };
+    }
+
+    private static float densityWeightedDistance(float distance, int matchCount) {
+        return distance / (float) Math.log1p(matchCount);
     }
 
     /** Drain the heap into ordinals, closest-first. {@code pop} yields farthest first, so fill from the back. */
