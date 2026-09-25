@@ -6,8 +6,10 @@
 package org.opensearch.knn.clusterann.read;
 
 import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.LongValues;
 import org.opensearch.knn.clusterann.read.orchestration.ClusterScan;
 import org.opensearch.knn.clusterann.read.orchestration.ScanContext;
@@ -32,6 +34,7 @@ public final class Clusters {
     private final ClusterANNFieldMeta fieldMeta;
     private final ClusterFactory clusterFactory;
     private final LongValues ordToDoc;
+    private final IndexInput ordToCentroidBase;
     private final CentroidVectorValues centroidsBase;
     private final Rotation rotation;
 
@@ -51,6 +54,9 @@ public final class Clusters {
         this.ordToDoc = ordToDoc(fieldMeta.ordToDoc(), postings);
         this.clusterFactory = new ClusterFactory(fieldMeta, postings, centroids, rotation);
         this.rotation = RotationFormats.read(fieldMeta.rotationId(), rotation, fieldMeta.dimension());
+
+        long ordToCentroidBytes = Math.multiplyExact((long) fieldMeta.vectorCount(), Integer.BYTES);
+        this.ordToCentroidBase = centroids.slice("ord-to-centroid", 0L, ordToCentroidBytes);
 
         long centroidsBytes = (long) fieldMeta.centroidCount() * floatsPerCentroid(fieldMeta.dimension()) * Float.BYTES;
         this.centroidsBase = new CentroidVectorValues(
@@ -92,6 +98,37 @@ public final class Clusters {
         return fieldMeta.centroidCount();
     }
 
+    /**
+     * Query-scoped centroid matches derived from this field's per-ordinal region-1 assignments.
+     *
+     * @param acceptedOrds ord-space filter membership, iterated by set bit
+     * @return centroids touched by the filter and their per-centroid match counts
+     */
+    public CentroidMatches centroidMatches(FixedBitSet acceptedOrds) throws IOException {
+        if (acceptedOrds == null) {
+            throw new IllegalArgumentException("acceptedOrds must be non-null");
+        }
+
+        final int[] matchCounts = new int[fieldMeta.centroidCount()];
+        final FixedBitSet acceptedCentroids = new FixedBitSet(fieldMeta.centroidCount());
+        if (fieldMeta.vectorCount() == 0 || fieldMeta.centroidCount() == 0) {
+            return new CentroidMatches(acceptedCentroids, matchCounts);
+        }
+
+        final int[] ordToCentroid = new int[fieldMeta.vectorCount()];
+        final IndexInput assignments = ordToCentroidBase.clone();
+        assignments.seek(0L);
+        assignments.readInts(ordToCentroid, 0, ordToCentroid.length);
+
+        for (int ord = acceptedOrds.nextSetBit(0); ord != DocIdSetIterator.NO_MORE_DOCS && ord < ordToCentroid.length; ord = acceptedOrds
+            .nextSetBit(ord + 1)) {
+            final int centroid = ordToCentroid[ord];
+            acceptedCentroids.set(centroid);
+            matchCounts[centroid]++;
+        }
+        return new CentroidMatches(acceptedCentroids, matchCounts);
+    }
+
     /** Number of vectors in this field, across all clusters. */
     public int numVectors() {
         return fieldMeta.vectorCount();
@@ -128,6 +165,9 @@ public final class Clusters {
      */
     public Cluster get(int ordinal) throws IOException {
         return clusterFactory.create(ordinal);
+    }
+
+    public record CentroidMatches(FixedBitSet acceptedCentroids, int[] matchCounts) {
     }
 
     private static LongValues ordToDoc(OrdToDocDISIReaderConfiguration config, IndexInput postings) throws IOException {
