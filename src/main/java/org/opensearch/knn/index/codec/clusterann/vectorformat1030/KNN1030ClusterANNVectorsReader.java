@@ -292,7 +292,7 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                 probes,
                 ScanParams.of(scanQuery),
                 translatedKnnCollector,
-                acceptedOrds,
+                acceptedOrdinals,
                 centroidMatches.matchCounts(),
                 exactScorer
             );

@@ -75,6 +75,46 @@ public class ScalarQuantizedBlockScorer implements BlockVectorScorer {
     }
 
     @Override
+    public boolean canSkipBlock(FixedBitSet validPos, float minCompetitiveSimilarity) {
+        if (minCompetitiveSimilarity == Float.NEGATIVE_INFINITY || sim == VectorSimilarityFunction.EUCLIDEAN) {
+            return false;
+        }
+
+        float maxUpper = Float.NEGATIVE_INFINITY;
+        float minLower = Float.MAX_VALUE;
+        float maxAdd = Float.NEGATIVE_INFINITY;
+        int maxAbsSum = 0;
+        for (int index = validPos.nextSetBit(0); index != DocIdSetIterator.NO_MORE_DOCS; index = nextSetBit(validPos, index)) {
+            if (reader.upper()[index] > maxUpper) {
+                maxUpper = reader.upper()[index];
+            }
+            if (reader.lower()[index] < minLower) {
+                minLower = reader.lower()[index];
+            }
+            if (reader.addCor()[index] > maxAdd) {
+                maxAdd = reader.addCor()[index];
+            }
+            int absSum = Math.abs(reader.sum()[index]);
+            if (absSum > maxAbsSum) {
+                maxAbsSum = absSum;
+            }
+        }
+
+        if (maxUpper == Float.NEGATIVE_INFINITY) {
+            return true;
+        }
+
+        float qLowerDim = quantizedQuery.lower() * dimension;
+        float qScaleCompSum = quantizedQuery.scale() * quantizedQuery.componentSum();
+        float centroidDotProductMinusNorm = quantizedQuery.correction() - quantizedQuery.centroidNormSq();
+        float maxDocScale = (maxUpper - minLower) * step();
+        float fastUpperBound = minLower * qLowerDim + Math.abs(quantizedQuery.lower()) * maxDocScale * maxAbsSum + Math.abs(minLower) * Math
+            .abs(qScaleCompSum) + maxDocScale * Math.abs(quantizedQuery.scale()) * packedBytes * 4f + maxAdd + centroidDotProductMinusNorm;
+        float fastSimilarity = fastUpperBound >= 0 ? fastUpperBound + 1f : 1f / (1f - fastUpperBound);
+        return fastSimilarity <= minCompetitiveSimilarity;
+    }
+
+    @Override
     public float scoreBlock(final FixedBitSet validPos, final BlockCandidates out) {
         if (validPos == null || out == null) {
             throw new IllegalArgumentException("validPos and out must not be null");
@@ -169,5 +209,10 @@ public class ScalarQuantizedBlockScorer implements BlockVectorScorer {
 
     private float step() {
         return 1f / ((1 << docBits) - 1);
+    }
+
+    private static int nextSetBit(FixedBitSet validPos, int index) {
+        int next = index + 1;
+        return next < validPos.length() ? validPos.nextSetBit(next) : DocIdSetIterator.NO_MORE_DOCS;
     }
 }

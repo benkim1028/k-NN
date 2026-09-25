@@ -30,6 +30,15 @@ public interface BlockVectorScorer {
     BlockVectorFormat.Reader reader();
 
     /**
+     * Whether this block can be rejected from its corrections alone, before the packed codes are read.
+     *
+     * <p>The default says no so existing scorers pay no extra contract unless they opt in.
+     */
+    default boolean canSkipBlock(FixedBitSet validPos, float minCompetitiveSimilarity) {
+        return false;
+    }
+
+    /**
      * Scores the positions set in {@code validPos} of {@link #reader()}'s current block, appending each
      * one's position and score to {@code out}.
      *

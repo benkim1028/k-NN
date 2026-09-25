@@ -22,6 +22,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.IntStream;
+import java.util.function.IntPredicate;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -153,6 +154,22 @@ class BlockPostingScorerTests {
     }
 
     @Test
+    void testAdvance_whenCorrectionsBoundCannotCompete_thenSkipsReadingThatBlock() throws IOException {
+        Scan scan = scanOver(ORDINALS, SCORES, null, block -> block == 1);
+
+        List<Hit> hits = drain(scan, 0.42f);
+
+        RecordingBlockReader expectedReader = readerThatSaw(ORDINALS.length).advanced(blocksWalked(ORDINALS.length))
+            .fetched(blocksUpTo(ORDINALS.length))
+            .read(List.of(0, 2))
+            .prefetched(blocksAfterFirst(ORDINALS.length))
+            .reader();
+
+        assertEquals(hitsAt(ORDINALS, SCORES, 8, 9, 10, 11), hits);
+        assertEquals(expectedReader, scan.reader);
+    }
+
+    @Test
     void testAdvance_whenAlreadyExhausted_thenKeepsReturningFalse() throws IOException {
         // given
         Scan scan = scanOver(ORDINALS, SCORES, null);
@@ -177,8 +194,12 @@ class BlockPostingScorerTests {
     }
 
     private static Scan scanOver(int[] ordinals, float[] scores, Bits acceptedOrds) {
+        return scanOver(ordinals, scores, acceptedOrds, block -> false);
+    }
+
+    private static Scan scanOver(int[] ordinals, float[] scores, Bits acceptedOrds, IntPredicate skipBlock) {
         RecordingBlockReader reader = new RecordingBlockReader(ordinals.length, BLOCK_SIZE);
-        BlockVectorScorer blockScorer = new TableScorer(reader, scores);
+        BlockVectorScorer blockScorer = new TableScorer(reader, scores, skipBlock);
         return new Scan(new BlockPostingScorer(blockScorer, ordinals, acceptedOrds), reader);
     }
 
@@ -392,15 +413,22 @@ class BlockPostingScorerTests {
     private static final class TableScorer implements BlockVectorScorer {
         private final RecordingBlockReader reader;
         private final float[] scoreByPosition;
+        private final IntPredicate skipBlock;
 
-        private TableScorer(RecordingBlockReader reader, float[] scoreByPosition) {
+        private TableScorer(RecordingBlockReader reader, float[] scoreByPosition, IntPredicate skipBlock) {
             this.reader = reader;
             this.scoreByPosition = scoreByPosition;
+            this.skipBlock = skipBlock;
         }
 
         @Override
         public BlockVectorFormat.Reader reader() {
             return reader;
+        }
+
+        @Override
+        public boolean canSkipBlock(FixedBitSet validPos, float minCompetitiveSimilarity) {
+            return minCompetitiveSimilarity > Float.NEGATIVE_INFINITY && skipBlock.test(reader.currentBlock);
         }
 
         @Override

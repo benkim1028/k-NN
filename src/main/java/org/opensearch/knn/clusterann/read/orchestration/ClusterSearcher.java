@@ -7,6 +7,7 @@ package org.opensearch.knn.clusterann.read.orchestration;
 
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.opensearch.knn.clusterann.read.Cluster;
 import org.opensearch.knn.clusterann.read.Clusters;
@@ -86,12 +87,19 @@ public final class ClusterSearcher {
         int[] probes,
         ScanParams params,
         KnnCollector collector,
-        Bits acceptedOrds,
+        FixedBitSet acceptedOrds,
         int[] filterMatchCounts,
         RandomVectorScorer exactScorer
     ) throws IOException {
-        if (clusters == null || params == null || probes == null || filterMatchCounts == null || exactScorer == null) {
-            throw new IllegalArgumentException("clusters, probes, params, filterMatchCounts and exactScorer must be non-null");
+        if (clusters == null
+            || params == null
+            || probes == null
+            || acceptedOrds == null
+            || filterMatchCounts == null
+            || exactScorer == null) {
+            throw new IllegalArgumentException(
+                "clusters, probes, params, acceptedOrds, filterMatchCounts and exactScorer must be non-null"
+            );
         }
         return searchFiltered(source(clusters), probes, params, collector, acceptedOrds, filterMatchCounts, exactScorer);
     }
@@ -101,12 +109,19 @@ public final class ClusterSearcher {
         int[] probes,
         ScanParams params,
         KnnCollector collector,
-        Bits acceptedOrds,
+        FixedBitSet acceptedOrds,
         int[] filterMatchCounts,
         RandomVectorScorer exactScorer
     ) throws IOException {
-        if (clusters == null || params == null || probes == null || filterMatchCounts == null || exactScorer == null) {
-            throw new IllegalArgumentException("clusters, probes, params, filterMatchCounts and exactScorer must be non-null");
+        if (clusters == null
+            || params == null
+            || probes == null
+            || acceptedOrds == null
+            || filterMatchCounts == null
+            || exactScorer == null) {
+            throw new IllegalArgumentException(
+                "clusters, probes, params, acceptedOrds, filterMatchCounts and exactScorer must be non-null"
+            );
         }
 
         if (clusters.numClusters() == 0 || probes.length == 0) {
@@ -121,10 +136,14 @@ public final class ClusterSearcher {
         long docsScored = 0;
         int consecutiveNonImproving = 0;
         final int k = collector.k();
+        final float filterSelectivity = clusters.numVectors() > 0 ? (float) acceptedOrds.cardinality() / clusters.numVectors() : 1.0f;
         for (int i = 0; i < probes.length; i++) {
             int probe = probes[i];
             Cluster cluster = clusters.get(probe);
             if (cluster.size() != 0) {
+                if (cluster.size() * filterSelectivity < 0.5f) {
+                    continue;
+                }
                 float thresholdBefore = collector.minCompetitiveSimilarity();
                 int scored = filterMatchCounts[probe] < k
                     ? scanClusterExact(cluster, wanted, visited, collector, exactScorer)

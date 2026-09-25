@@ -79,6 +79,9 @@ public class BlockPostingScorer implements PostingScorer {
             int vectorCount = reader.blockVectorCount();
             if (validPos(postingVectorOffset, vectorCount) != 0) {
                 reader.fetchBlock();
+                if (scorer.canSkipBlock(validPos, minCompetitiveSimilarity)) {
+                    continue;
+                }
                 reader.readBlockVectors();
 
                 float maxScore = scorer.scoreBlock(validPos, candidates);
