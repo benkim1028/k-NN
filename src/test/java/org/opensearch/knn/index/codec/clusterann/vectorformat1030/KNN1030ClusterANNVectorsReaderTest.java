@@ -11,6 +11,7 @@ import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.index.DocValuesSkipIndexType;
 import org.apache.lucene.index.DocValuesType;
+import org.apache.lucene.index.DocsWithFieldSet;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.FloatVectorValues;
@@ -22,17 +23,22 @@ import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.KnnCollector;
+import org.apache.lucene.search.knn.KnnSearchStrategy;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.tests.store.MockDirectoryWrapper;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.StringHelper;
 import org.apache.lucene.util.Version;
+import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
+import org.opensearch.knn.clusterann.format.ClusterANNFormatConstants;
 import org.opensearch.knn.clusterann.read.ClusterANNFieldMetaEncoder;
 
 import java.io.IOException;
@@ -41,6 +47,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -402,6 +409,51 @@ class KNN1030ClusterANNVectorsReaderTest {
         verify(raw, never()).getRandomVectorScorer(any(String.class), any(float[].class));
     }
 
+    @Test
+    void search_whenSelectiveFilterOnSparseSegment_thenExactRouteUsesOrdToDocMapping() throws Exception {
+        // given
+        KNN1030ClusterANNVectorsReader sparse = openReaderWithSparseOrdToDoc(new int[] { 2, 5, 9 }, 12);
+        RandomVectorScorer exactScorer = mock(RandomVectorScorer.class);
+        when(raw.getRandomVectorScorer(any(String.class), any(float[].class))).thenReturn(exactScorer);
+        when(exactScorer.score(0)).thenReturn(0.9f);
+        when(exactScorer.score(2)).thenReturn(0.7f);
+
+        FixedBitSet acceptedDocs = new FixedBitSet(12);
+        acceptedDocs.set(2);
+        acceptedDocs.set(9);
+
+        AcceptDocs acceptDocs = mock(AcceptDocs.class);
+        when(acceptDocs.bits()).thenReturn(acceptedDocs);
+        when(acceptDocs.cost()).thenReturn(2);
+
+        RecordingCollector collector = new RecordingCollector();
+
+        // when
+        sparse.search(FIELD, query(), collector, acceptDocs);
+
+        // then
+        verify(exactScorer).score(0);
+        verify(exactScorer, never()).score(1);
+        verify(exactScorer).score(2);
+        assertEquals(List.of(2, 9), collector.collectedDocs);
+    }
+
+    @Test
+    void search_whenFilterBitsExistButCostCoversAllVectors_thenSkipsExactRoute() throws Exception {
+        // given
+        final FixedBitSet acceptedDocs = new FixedBitSet(MAX_DOC);
+        acceptedDocs.set(0, 30);
+        final AcceptDocs acceptDocs = mock(AcceptDocs.class);
+        when(acceptDocs.bits()).thenReturn(acceptedDocs);
+        when(acceptDocs.cost()).thenReturn(30);
+
+        // when
+        reader.search(FIELD, query(), mock(KnnCollector.class), acceptDocs);
+
+        // then
+        verify(raw, never()).getRandomVectorScorer(any(String.class), any(float[].class));
+    }
+
     // ---------------------------------------------------------------- helpers
 
     /**
@@ -432,6 +484,35 @@ class KNN1030ClusterANNVectorsReaderTest {
 
     private KNN1030ClusterANNVectorsReader openReader(FieldInfo info, ClusterANNFieldMetaEncoder entry) throws IOException {
         return openReader(info, entry, FIELD_NUMBER);
+    }
+
+    private KNN1030ClusterANNVectorsReader openReaderWithSparseOrdToDoc(int[] docsWithVectors, int maxDoc) throws IOException {
+        final MockDirectoryWrapper directory = new MockDirectoryWrapper(new Random(), new ByteBuffersDirectory());
+        directory.setCheckIndexOnClose(false);
+        directories.add(directory);
+
+        final SegmentInfo segmentInfo = new SegmentInfo(
+            directory,
+            Version.LATEST,
+            null,
+            SEGMENT,
+            maxDoc,
+            false,
+            false,
+            null,
+            Map.of(),
+            StringHelper.randomId(),
+            Map.of(),
+            null
+        );
+        final FieldInfos fieldInfos = new FieldInfos(new FieldInfo[] { floatVectorField(DIMENSION, SIMILARITY) });
+        final SegmentReadState state = new SegmentReadState(directory, segmentInfo, fieldInfos, IOContext.DEFAULT);
+
+        writeSparseMeta(state, sparseEntry(docsWithVectors.length), docs(docsWithVectors), maxDoc);
+        writeBlank(state, KNN1030ClusterANNVectorsFormat.CENTROIDS_EXTENSION);
+        final KNN1030ClusterANNVectorsReader opened = new KNN1030ClusterANNVectorsReader(state, raw);
+        readers.add(opened);
+        return opened;
     }
 
     /**
@@ -535,6 +616,78 @@ class KNN1030ClusterANNVectorsReaderTest {
         }
     }
 
+    private static void writeSparseMeta(SegmentReadState state, ClusterANNFieldMeta entry, DocsWithFieldSet docsWithField, int maxDoc)
+        throws IOException {
+        final String metaName = IndexFileNames.segmentFileName(
+            state.segmentInfo.name,
+            state.segmentSuffix,
+            KNN1030ClusterANNVectorsFormat.META_EXTENSION
+        );
+        final String postingsName = IndexFileNames.segmentFileName(
+            state.segmentInfo.name,
+            state.segmentSuffix,
+            KNN1030ClusterANNVectorsFormat.POSTINGS_EXTENSION
+        );
+
+        try (
+            IndexOutput metaOut = state.directory.createOutput(metaName, IOContext.DEFAULT);
+            IndexOutput postingsOut = state.directory.createOutput(postingsName, IOContext.DEFAULT)
+        ) {
+            CodecUtil.writeIndexHeader(
+                metaOut,
+                KNN1030ClusterANNVectorsFormat.META_CODEC_NAME,
+                KNN1030ClusterANNVectorsFormat.VERSION_CURRENT,
+                state.segmentInfo.getId(),
+                state.segmentSuffix
+            );
+            metaOut.writeVInt(BLOCK_SIZE);
+            metaOut.writeInt(FIELD_NUMBER);
+            entry.write(metaOut, postingsOut, maxDoc, docsWithField);
+            metaOut.writeInt(-1);
+            CodecUtil.writeFooter(metaOut);
+
+            long bytesToPad = DATA_FILE_BYTES - postingsOut.getFilePointer();
+            if (bytesToPad > 0) {
+                postingsOut.writeBytes(new byte[(int) bytesToPad], 0, (int) bytesToPad);
+            }
+            CodecUtil.writeFooter(postingsOut);
+        }
+    }
+
+    private static ClusterANNFieldMeta sparseEntry(int vectorCount) {
+        return new ClusterANNFieldMeta(
+            BLOCK_SIZE,
+            DIMENSION,
+            vectorCount,
+            1,
+            SIMILARITY,
+            DOC_BITS,
+            ClusterANNFormatConstants.ROTATION_NONE,
+            ClusterANNFormatConstants.QUANTIZER_OPTIMIZED_SQ,
+            new byte[0],
+            0L,
+            512L,
+            64L,
+            -1L,
+            0L,
+            900L,
+            new long[] { 0L },
+            new int[] { 100 },
+            new int[] { vectorCount },
+            -1L,
+            -1L,
+            null
+        );
+    }
+
+    private static DocsWithFieldSet docs(int... docIds) throws IOException {
+        DocsWithFieldSet docs = new DocsWithFieldSet();
+        for (int docId : docIds) {
+            docs.add(docId);
+        }
+        return docs;
+    }
+
     private static FieldInfo floatVectorField(int dimension, VectorSimilarityFunction similarity) {
         return vectorField(dimension, VectorEncoding.FLOAT32, similarity);
     }
@@ -560,5 +713,54 @@ class KNN1030ClusterANNVectorsReaderTest {
             false,
             false
         );
+    }
+
+    private static final class RecordingCollector implements KnnCollector {
+
+        private final List<Integer> collectedDocs = new ArrayList<>();
+
+        @Override
+        public boolean earlyTerminated() {
+            return false;
+        }
+
+        @Override
+        public void incVisitedCount(int count) {}
+
+        @Override
+        public long visitedCount() {
+            return collectedDocs.size();
+        }
+
+        @Override
+        public long visitLimit() {
+            return Long.MAX_VALUE;
+        }
+
+        @Override
+        public int k() {
+            return 10;
+        }
+
+        @Override
+        public boolean collect(int docId, float similarity) {
+            collectedDocs.add(docId);
+            return true;
+        }
+
+        @Override
+        public float minCompetitiveSimilarity() {
+            return Float.NEGATIVE_INFINITY;
+        }
+
+        @Override
+        public org.apache.lucene.search.TopDocs topDocs() {
+            throw new UnsupportedOperationException("not needed by these tests");
+        }
+
+        @Override
+        public KnnSearchStrategy getSearchStrategy() {
+            return null;
+        }
     }
 }

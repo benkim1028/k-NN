@@ -26,6 +26,7 @@ import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.hnsw.OrdinalTranslatedKnnCollector;
+import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
 import org.opensearch.knn.clusterann.read.Clusters;
 import org.opensearch.knn.clusterann.read.ScanParams;
@@ -49,6 +50,8 @@ import java.util.Arrays;
  */
 @Log4j2
 public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
+
+    static final long EXACT_FILTER_THRESHOLD = 2_048_000L;
 
     private final SegmentReadState segmentReadState;
     private final FlatVectorsReader rawFlatVectorsReader;
@@ -244,12 +247,20 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
             return;
         }
 
+        final int numVectors = fieldClusters.numVectors();
+        final Bits acceptedDocBits = acceptDocs.bits();
+        final int filterCost = acceptDocs.cost();
         final LongValues ordToDoc = fieldClusters.ordToDoc();
         final OrdinalTranslatedKnnCollector translatedKnnCollector = new OrdinalTranslatedKnnCollector(
             knnCollector,
             (ord) -> Math.toIntExact(ordToDoc.get(ord))
         );
-        Bits acceptedOrds = buildAcceptedOrds(acceptDocs, ordToDoc, fieldClusters.numVectors());
+        final Bits acceptedOrds = buildAcceptedOrds(acceptedDocBits, ordToDoc, numVectors);
+
+        if (useExactFilterRoute(acceptedDocBits, filterCost, numVectors, fieldClusters.clusterMeta().dimension())) {
+            exactSearch(fieldName, query, translatedKnnCollector, acceptedOrds, numVectors);
+            return;
+        }
 
         int[] probes = CentroidPlanner.plan(fieldClusters, query, PlanParams.of(fieldClusters.numClusters()));
 
@@ -259,10 +270,31 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
         ClusterSearcher.search(fieldClusters, probes, ScanParams.of(scanQuery), translatedKnnCollector, acceptedOrds);
     }
 
-    private Bits buildAcceptedOrds(AcceptDocs acceptDocs, LongValues ordToDoc, int numVectors) throws IOException {
-        if (acceptDocs == null) return null;
+    static boolean useExactFilterRoute(Bits acceptedDocBits, int filterCost, int numVectors, int dimension) {
+        return acceptedDocBits != null && filterCost < numVectors && ((long) filterCost * dimension) <= EXACT_FILTER_THRESHOLD;
+    }
 
-        Bits docBits = acceptDocs.bits();
+    private void exactSearch(String fieldName, float[] query, KnnCollector collector, Bits acceptedOrds, int numVectors)
+        throws IOException {
+        if (acceptedOrds == null) {
+            return;
+        }
+
+        final RandomVectorScorer exactScorer = rawFlatVectorsReader.getRandomVectorScorer(fieldName, query);
+        if (exactScorer == null) {
+            return;
+        }
+
+        // This keeps the POC's O(numVectors) ordinal walk, but uses this tree's ord->doc translation through acceptedOrds.
+        for (int ord = 0; ord < numVectors; ord++) {
+            if (acceptedOrds.get(ord)) {
+                collector.incVisitedCount(1);
+                collector.collect(ord, exactScorer.score(ord));
+            }
+        }
+    }
+
+    private Bits buildAcceptedOrds(Bits docBits, LongValues ordToDoc, int numVectors) {
         if (docBits == null) return null; // match-all
 
         return new Bits() {
