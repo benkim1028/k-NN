@@ -85,7 +85,7 @@ public final class CentroidPlanner {
 
         final NeighborQueue nearest = new NeighborQueue(params.maxProbes(), true);
         for (int ordinal = acceptedCentroids.nextSetBit(0); ordinal != DocIdSetIterator.NO_MORE_DOCS && ordinal < numClusters; ordinal =
-            acceptedCentroids.nextSetBit(ordinal + 1)) {
+            ordinal + 1 < acceptedCentroids.length() ? acceptedCentroids.nextSetBit(ordinal + 1) : DocIdSetIterator.NO_MORE_DOCS) {
             if (clusters.clusterSize(ordinal) != 0 && matchCounts[ordinal] > 0) {
                 final float[] centroid = centroids.vectorValue(ordinal);
                 nearest.insertWithOverflow(ordinal, distanceKey(similarity, query, queryNormSq, centroid, centroids));
