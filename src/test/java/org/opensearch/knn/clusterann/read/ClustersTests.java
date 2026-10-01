@@ -192,6 +192,22 @@ class ClustersTests {
         assertEquals(3, matches.acceptedCentroids().cardinality());
     }
 
+    @Test
+    void testCentroidMatches_whenLastOrdinalAcceptedAtMultipleOf64_thenCountsItWithoutThrowing() throws IOException {
+        // given
+        int[] ordToCentroid = new int[128];
+        ordToCentroid[ordToCentroid.length - 1] = 2;
+        FixedBitSet acceptedOrds = new FixedBitSet(ordToCentroid.length);
+        acceptedOrds.set(ordToCentroid.length - 1);
+
+        // when
+        Clusters.CentroidMatches matches = clustersWithAssignments(ordToCentroid).centroidMatches(acceptedOrds);
+
+        // then
+        assertEquals(1, matches.matchCounts()[2]);
+        assertTrue(matches.acceptedCentroids().get(2));
+    }
+
     // ---------------------------------------------------------------- scan
 
     /**

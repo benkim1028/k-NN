@@ -42,6 +42,9 @@ import org.junit.jupiter.api.Test;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
 import org.opensearch.knn.clusterann.format.ClusterANNFormatConstants;
 import org.opensearch.knn.clusterann.read.ClusterANNFieldMetaEncoder;
+import org.opensearch.knn.clusterann.write.CentroidsWriter;
+import org.opensearch.knn.clusterann.write.CentroidsWriter.CentroidData;
+import org.opensearch.knn.clusterann.write.CentroidsWriter.CentroidOffsets;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -60,6 +63,9 @@ class KNN1030ClusterANNVectorsReaderFilteringTest {
     private static final int DIMENSION = 8;
     private static final int BLOCK_SIZE = 32;
     private static final int MAX_DOC = 100;
+    private static final int FILTERED_ROUTE_VECTOR_COUNT = 1_048_576;
+    private static final int FILTERED_ROUTE_COST = 262_145;
+    private static final int FILTERED_ROUTE_CENTROID_COUNT = 64;
     private static final byte DOC_BITS = 1;
     private static final int DATA_FILE_BYTES = 4096;
 
@@ -101,6 +107,22 @@ class KNN1030ClusterANNVectorsReaderFilteringTest {
         reader.search(FIELD, query(), new RecordingCollector(), new StaticAcceptDocs(acceptedDocs, 30));
 
         assertEquals(0, flatReader.floatRandomScorerRequests);
+    }
+
+    @Test
+    void search_whenBenchmark25PercentFilterAcceptsFinalDocument_thenFilteredRouteDoesNotThrow() throws Exception {
+        StubFlatVectorsReader flatReader = new StubFlatVectorsReader(new RecordingRandomVectorScorer(Map.of()));
+        KNN1030ClusterANNVectorsReader reader = openFilteredRouteReader(flatReader);
+
+        FixedBitSet acceptedDocs = new FixedBitSet(FILTERED_ROUTE_VECTOR_COUNT);
+        acceptedDocs.set(0, FILTERED_ROUTE_COST - 1);
+        acceptedDocs.set(FILTERED_ROUTE_VECTOR_COUNT - 1);
+
+        RecordingCollector collector = new RecordingCollector();
+        reader.search(FIELD, query(), collector, new StaticAcceptDocs(acceptedDocs, FILTERED_ROUTE_COST));
+
+        assertEquals(List.of(), collector.collectedDocs);
+        assertEquals(1, flatReader.floatRandomScorerRequests);
     }
 
     private KNN1030ClusterANNVectorsReader openDenseReader(StubFlatVectorsReader flatReader) throws IOException {
@@ -172,6 +194,69 @@ class KNN1030ClusterANNVectorsReaderFilteringTest {
         KNN1030ClusterANNVectorsReader opened = new KNN1030ClusterANNVectorsReader(state, flatReader);
         readers.add(opened);
         return opened;
+    }
+
+    private KNN1030ClusterANNVectorsReader openFilteredRouteReader(StubFlatVectorsReader flatReader) throws IOException {
+        MockDirectoryWrapper directory = new MockDirectoryWrapper(new Random(), new ByteBuffersDirectory());
+        directory.setCheckIndexOnClose(false);
+        directories.add(directory);
+
+        SegmentInfo segmentInfo = new SegmentInfo(
+            directory,
+            Version.LATEST,
+            null,
+            SEGMENT,
+            FILTERED_ROUTE_VECTOR_COUNT,
+            false,
+            false,
+            null,
+            Map.of(),
+            StringHelper.randomId(),
+            Map.of(),
+            null
+        );
+        FieldInfos fieldInfos = new FieldInfos(new FieldInfo[] { floatVectorField(DIMENSION, VectorSimilarityFunction.EUCLIDEAN) });
+        SegmentReadState state = new SegmentReadState(directory, segmentInfo, fieldInfos, IOContext.DEFAULT);
+
+        CentroidFixture centroidFixture = writeFilteredRouteCentroids(state);
+        ClusterANNFieldMetaEncoder entry = new ClusterANNFieldMetaEncoder().dimension(DIMENSION)
+            .vectorCount(FILTERED_ROUTE_VECTOR_COUNT)
+            .centroidCount(FILTERED_ROUTE_CENTROID_COUNT)
+            .similarityFunction(ClusterANNFieldMetaEncoder.SIMILARITY_L2)
+            .rotationId((byte) ClusterANNFormatConstants.ROTATION_NONE)
+            .docBits(DOC_BITS)
+            .clacLength(centroidFixture.length())
+            .clacCentroidsOffset(centroidFixture.offsets().clacCentroidsOffset())
+            .clapLength(DATA_FILE_BYTES)
+            .clapCentroidOffsets(new long[FILTERED_ROUTE_CENTROID_COUNT])
+            .centroidLengths(new int[FILTERED_ROUTE_CENTROID_COUNT])
+            .clusterSizes(new int[FILTERED_ROUTE_CENTROID_COUNT]);
+        writeDenseMeta(state, entry, FIELD_NUMBER);
+        writeBlank(state, KNN1030ClusterANNVectorsFormat.POSTINGS_EXTENSION);
+
+        KNN1030ClusterANNVectorsReader opened = new KNN1030ClusterANNVectorsReader(state, flatReader);
+        readers.add(opened);
+        return opened;
+    }
+
+    private static CentroidFixture writeFilteredRouteCentroids(SegmentReadState state) throws IOException {
+        String name = IndexFileNames.segmentFileName(
+            state.segmentInfo.name,
+            state.segmentSuffix,
+            KNN1030ClusterANNVectorsFormat.CENTROIDS_EXTENSION
+        );
+        int[] ordToCentroid = new int[FILTERED_ROUTE_VECTOR_COUNT];
+        float[][] centroids = new float[FILTERED_ROUTE_CENTROID_COUNT][DIMENSION];
+        try (IndexOutput out = state.directory.createOutput(name, IOContext.DEFAULT)) {
+            CentroidOffsets offsets = CentroidsWriter.write(
+                out,
+                new CentroidData(ordToCentroid, centroids),
+                org.opensearch.knn.clusterann.format.rotation.RotationFormats.create(ClusterANNFormatConstants.ROTATION_NONE, DIMENSION)
+            );
+            long length = out.getFilePointer();
+            CodecUtil.writeFooter(out);
+            return new CentroidFixture(length, offsets);
+        }
     }
 
     private static void writeDenseMeta(SegmentReadState state, ClusterANNFieldMetaEncoder entry, int entryFieldNumber) throws IOException {
@@ -451,5 +536,8 @@ class KNN1030ClusterANNVectorsReaderFilteringTest {
         public KnnSearchStrategy getSearchStrategy() {
             return null;
         }
+    }
+
+    private record CentroidFixture(long length, CentroidOffsets offsets) {
     }
 }

@@ -120,8 +120,8 @@ public final class Clusters {
         assignments.seek(0L);
         assignments.readInts(ordToCentroid, 0, ordToCentroid.length);
 
-        for (int ord = acceptedOrds.nextSetBit(0); ord != DocIdSetIterator.NO_MORE_DOCS && ord < ordToCentroid.length; ord = acceptedOrds
-            .nextSetBit(ord + 1)) {
+        for (int ord = acceptedOrds.nextSetBit(0); ord != DocIdSetIterator.NO_MORE_DOCS && ord < ordToCentroid.length; ord = ord
+            + 1 < acceptedOrds.length() ? acceptedOrds.nextSetBit(ord + 1) : DocIdSetIterator.NO_MORE_DOCS) {
             final int centroid = ordToCentroid[ord];
             acceptedCentroids.set(centroid);
             matchCounts[centroid]++;
