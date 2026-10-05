@@ -32,6 +32,9 @@ public interface Cluster extends Accountable {
     /** Number of vectors in this cluster (primary + SOAR). */
     int size();
 
+    /** Count accepted SOAR entries in this cluster without scoring them. */
+    int countAcceptedSecondaries(Bits acceptedOrds) throws IOException;
+
     /**
      * Hint that this posting will be read soon so it can be warmed first.
      *

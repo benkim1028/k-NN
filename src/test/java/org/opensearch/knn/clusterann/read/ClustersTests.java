@@ -208,6 +208,22 @@ class ClustersTests {
         assertTrue(matches.acceptedCentroids().get(2));
     }
 
+    @Test
+    void testCentroidMatches_whenClusterMatchIsOnlyASecondary_thenIncludesIt() throws IOException {
+        // given
+        int[] ordToCentroid = new int[VECTOR_COUNT];
+        FixedBitSet acceptedOrds = new FixedBitSet(VECTOR_COUNT);
+        acceptedOrds.set(0);
+
+        // when
+        Clusters.CentroidMatches matches = clustersWithAssignmentsAndSecondary(ordToCentroid).centroidMatches(acceptedOrds);
+
+        // then
+        assertEquals(1, matches.matchCounts()[0], "primary assignment");
+        assertEquals(1, matches.matchCounts()[2], "SOAR secondary assignment");
+        assertTrue(matches.acceptedCentroids().get(2), "a secondary-only match makes the cluster eligible");
+    }
+
     // ---------------------------------------------------------------- scan
 
     /**
@@ -315,6 +331,46 @@ class ClustersTests {
             fixture.input(),
             fieldMeta(VectorSimilarityFunction.EUCLIDEAN, ordToCentroid.length, fixture.length(), fixture.offsets().clacCentroidsOffset())
         );
+    }
+
+    private Clusters clustersWithAssignmentsAndSecondary(int[] ordToCentroid) throws IOException {
+        ClacFixture fixture = clacWithAssignments(ordToCentroid);
+        return new Clusters(
+            clapWithSecondary(),
+            fixture.input(),
+            null,
+            fieldMeta(VectorSimilarityFunction.EUCLIDEAN, ordToCentroid.length, fixture.length(), fixture.offsets().clacCentroidsOffset())
+        );
+    }
+
+    private IndexInput clapWithSecondary() throws IOException {
+        Directory directory = new ByteBuffersDirectory();
+        directories.add(directory);
+        try (IndexOutput out = directory.createOutput("clap-secondary", IOContext.DEFAULT)) {
+            writePosting(out, new int[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }, -1, CENTROID_LENGTHS[0]);
+            writePosting(out, new int[] { 10, 11, 12, 13, 14, 15 }, -1, CENTROID_LENGTHS[1]);
+            writePosting(out, new int[] { 0, 17, 18 }, 0, CENTROID_LENGTHS[2]);
+        }
+        return directory.openInput("clap-secondary", IOContext.DEFAULT);
+    }
+
+    private static void writePosting(IndexOutput out, int[] ordinals, int secondaryPosition, int length) throws IOException {
+        final long start = out.getFilePointer();
+        for (int ordinal : ordinals) {
+            out.writeInt(ordinal);
+        }
+        final FixedBitSet secondaries = new FixedBitSet(ordinals.length);
+        if (secondaryPosition >= 0) {
+            secondaries.set(secondaryPosition);
+        }
+        for (long bits : secondaries.getBits()) {
+            out.writeLong(bits);
+        }
+        for (int ignored : ordinals) {
+            out.writeInt(0);
+        }
+        final int padding = Math.toIntExact(length - (out.getFilePointer() - start));
+        out.writeBytes(new byte[padding], 0, padding);
     }
 
     private ClacFixture clacWithAssignments(int[] ordToCentroid) throws IOException {

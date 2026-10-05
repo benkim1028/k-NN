@@ -27,6 +27,7 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.tests.store.MockDirectoryWrapper;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.StringHelper;
 import org.apache.lucene.util.Version;
@@ -331,6 +332,23 @@ class KNN1030ClusterANNVectorsReaderTest {
         // when / then — reaching the end without throwing is the assertion. The query is the field's own width: the
         // rotation is applied before the walk, and one of the wrong length is rejected before the filter is reached.
         reader.search(FIELD, new float[DIMENSION], collector, mock(AcceptDocs.class));
+        verify(raw, never()).getRandomVectorScorer(any(String.class), any(float[].class));
+    }
+
+    @Test
+    void search_whenNonNullFilterBitsAcceptEveryVector_thenUsesTheUnfilteredPath() throws Exception {
+        // given
+        final KnnCollector collector = mock(KnnCollector.class);
+        final AcceptDocs acceptDocs = mock(AcceptDocs.class);
+        final FixedBitSet allDocs = new FixedBitSet(MAX_DOC);
+        allDocs.set(0, MAX_DOC);
+        when(acceptDocs.bits()).thenReturn(allDocs);
+
+        // when
+        reader.search(FIELD, new float[DIMENSION], collector, acceptDocs);
+
+        // then
+        verify(collector, atLeastOnce()).collect(anyInt(), anyFloat());
         verify(raw, never()).getRandomVectorScorer(any(String.class), any(float[].class));
     }
 
