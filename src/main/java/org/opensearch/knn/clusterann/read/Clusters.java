@@ -126,6 +126,16 @@ public final class Clusters {
             acceptedCentroids.set(centroid);
             matchCounts[centroid]++;
         }
+        for (int centroid = 0; centroid < matchCounts.length; centroid++) {
+            if (clusterSize(centroid) == 0) {
+                continue;
+            }
+            final int secondaryMatches = get(centroid).countAcceptedSecondaries(acceptedOrds);
+            if (secondaryMatches > 0) {
+                acceptedCentroids.set(centroid);
+                matchCounts[centroid] += secondaryMatches;
+            }
+        }
         return new CentroidMatches(acceptedCentroids, matchCounts);
     }
 

@@ -29,6 +29,7 @@ import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class CentroidPlannerFilteringTest {
 
@@ -67,6 +68,53 @@ class CentroidPlannerFilteringTest {
     }
 
     @Test
+    void testPlanFiltered_whenMaximumInnerProduct_thenRanksByPlainInnerProduct() throws IOException {
+        // given
+        float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 0.1f, 0f } };
+        FixedBitSet acceptedCentroids = new FixedBitSet(centroids.length);
+        acceptedCentroids.set(0);
+        acceptedCentroids.set(1);
+        int[] matchCounts = { 10, 1, 0 };
+
+        // when
+        int[] probes = CentroidPlanner.plan(
+            clusters(VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT, centroids),
+            new float[] { 1f, 0f },
+            new PlanParams(1, centroids.length),
+            acceptedCentroids,
+            matchCounts
+        );
+
+        // then
+        assertArrayEquals(new int[] { 1, 0 }, probes);
+    }
+
+    @Test
+    void testPlanFiltered_whenAllClustersMatch_thenUsesUnfilteredMaxProbesAndOrder() throws IOException {
+        // given
+        float[][] centroids = new float[64][DIMENSION];
+        int[] clusterSizes = new int[centroids.length];
+        FixedBitSet acceptedCentroids = new FixedBitSet(centroids.length);
+        int[] matchCounts = new int[centroids.length];
+        for (int ordinal = 0; ordinal < centroids.length; ordinal++) {
+            centroids[ordinal][0] = ordinal + 1;
+            clusterSizes[ordinal] = 1;
+            acceptedCentroids.set(ordinal);
+            matchCounts[ordinal] = ordinal + 1;
+        }
+        Clusters clusters = clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, clusterSizes);
+        PlanParams params = PlanParams.of(centroids.length);
+
+        // when
+        int[] filtered = CentroidPlanner.plan(clusters, new float[DIMENSION], params, acceptedCentroids, matchCounts);
+        int[] unfiltered = CentroidPlanner.plan(clusters, new float[DIMENSION], params);
+
+        // then
+        assertArrayEquals(unfiltered, filtered);
+        assertEquals(params.maxProbes(), filtered.length);
+    }
+
+    @Test
     void testPlanFiltered_whenLastCentroidAcceptedAtMultipleOf64_thenIncludesItWithoutThrowing() throws IOException {
         // given
         float[][] centroids = new float[64][DIMENSION];
@@ -91,10 +139,18 @@ class CentroidPlannerFilteringTest {
     }
 
     private Clusters clusters(float[][] centroids) throws IOException {
-        return clusters(centroids, CLUSTER_SIZES);
+        return clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, CLUSTER_SIZES);
     }
 
     private Clusters clusters(float[][] centroids, int[] clusterSizes) throws IOException {
+        return clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, clusterSizes);
+    }
+
+    private Clusters clusters(VectorSimilarityFunction similarity, float[][] centroids) throws IOException {
+        return clusters(similarity, centroids, CLUSTER_SIZES);
+    }
+
+    private Clusters clusters(VectorSimilarityFunction similarity, float[][] centroids, int[] clusterSizes) throws IOException {
         int[] ordToCentroid = new int[Arrays.stream(clusterSizes).sum()];
         int vectorOrdinal = 0;
         for (int centroidOrdinal = 0; centroidOrdinal < clusterSizes.length; centroidOrdinal++) {
@@ -106,7 +162,7 @@ class CentroidPlannerFilteringTest {
             open("clap", 3000),
             clac.input(),
             null,
-            fieldMeta(ordToCentroid.length, clac.length(), clac.offsets().clacCentroidsOffset(), clusterSizes)
+            fieldMeta(similarity, ordToCentroid.length, clac.length(), clac.offsets().clacCentroidsOffset(), clusterSizes)
         );
     }
 
@@ -125,15 +181,20 @@ class CentroidPlannerFilteringTest {
         return new ClacFixture(input, input.length(), offsets);
     }
 
-    private static ClusterANNFieldMeta fieldMeta(int vectorCount, long clacLength, long clacCentroidsOffset, int[] clusterSizes)
-        throws IOException {
+    private static ClusterANNFieldMeta fieldMeta(
+        VectorSimilarityFunction similarity,
+        int vectorCount,
+        long clacLength,
+        long clacCentroidsOffset,
+        int[] clusterSizes
+    ) throws IOException {
         int centroidCount = clusterSizes.length;
         return new ClusterANNFieldMeta(
             32,
             DIMENSION,
             vectorCount,
             centroidCount,
-            VectorSimilarityFunction.EUCLIDEAN,
+            similarity,
             1,
             ClusterANNFormatConstants.ROTATION_NONE,
             ClusterANNFormatConstants.QUANTIZER_OPTIMIZED_SQ,
