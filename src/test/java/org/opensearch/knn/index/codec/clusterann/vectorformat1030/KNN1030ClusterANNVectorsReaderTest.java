@@ -337,7 +337,13 @@ class KNN1030ClusterANNVectorsReaderTest {
 
     @Test
     void search_whenNonNullFilterBitsAcceptEveryVector_thenUsesTheUnfilteredPath() throws Exception {
-        // given
+        // given — invalid assignment ordinals would fail immediately if this search entered filtered planning.
+        final int vectorCount = 4;
+        final KNN1030ClusterANNVectorsReader assignmentPoisoned = openReaderWithPoisonedAssignments(
+            floatVectorField(DIMENSION, SIMILARITY),
+            validEntry().vectorCount(vectorCount).centroidCount(3).clacCentroidsOffset((long) vectorCount * Integer.BYTES),
+            vectorCount
+        );
         final KnnCollector collector = mock(KnnCollector.class);
         final AcceptDocs acceptDocs = mock(AcceptDocs.class);
         final FixedBitSet allDocs = new FixedBitSet(MAX_DOC);
@@ -345,7 +351,7 @@ class KNN1030ClusterANNVectorsReaderTest {
         when(acceptDocs.bits()).thenReturn(allDocs);
 
         // when
-        reader.search(FIELD, new float[DIMENSION], collector, acceptDocs);
+        assignmentPoisoned.search(FIELD, new float[DIMENSION], collector, acceptDocs);
 
         // then
         verify(collector, atLeastOnce()).collect(anyInt(), anyFloat());
@@ -452,6 +458,17 @@ class KNN1030ClusterANNVectorsReaderTest {
         return openReader(info, entry, FIELD_NUMBER);
     }
 
+    private KNN1030ClusterANNVectorsReader openReaderWithPoisonedAssignments(
+        FieldInfo info,
+        ClusterANNFieldMetaEncoder entry,
+        int poisonedAssignmentCount
+    ) throws IOException {
+        final MockDirectoryWrapper directory = new MockDirectoryWrapper(new Random(), new ByteBuffersDirectory());
+        directory.setCheckIndexOnClose(false);
+        directories.add(directory);
+        return openReader(directory, info, entry, FIELD_NUMBER, poisonedAssignmentCount);
+    }
+
     /**
      * Builds a one-field segment whose metadata file holds {@code entry} under {@code entryFieldNumber}, then
      * opens a reader over it. The entry's field number is separate from the {@link FieldInfo}'s own so a case
@@ -478,6 +495,16 @@ class KNN1030ClusterANNVectorsReaderTest {
         ClusterANNFieldMetaEncoder entry,
         int entryFieldNumber
     ) throws IOException {
+        return openReader(directory, info, entry, entryFieldNumber, 0);
+    }
+
+    private KNN1030ClusterANNVectorsReader openReader(
+        Directory directory,
+        FieldInfo info,
+        ClusterANNFieldMetaEncoder entry,
+        int entryFieldNumber,
+        int poisonedAssignmentCount
+    ) throws IOException {
         final SegmentInfo segmentInfo = new SegmentInfo(
             directory,
             Version.LATEST,
@@ -501,7 +528,7 @@ class KNN1030ClusterANNVectorsReaderTest {
         // long enough to hold the regions the entry describes. Nothing here reads them — Clusters only holds them
         // and clones per access — so blank bytes are enough.
         writeBlank(state, KNN1030ClusterANNVectorsFormat.POSTINGS_EXTENSION);
-        writeBlank(state, KNN1030ClusterANNVectorsFormat.CENTROIDS_EXTENSION);
+        writeCentroids(state, poisonedAssignmentCount);
 
         // .clar exists only for a rotated field, which is what lets the unrotated cases assert the reader does not
         // go looking for it.
@@ -526,6 +553,22 @@ class KNN1030ClusterANNVectorsReaderTest {
         String name = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, extension);
         try (IndexOutput out = state.directory.createOutput(name, IOContext.DEFAULT)) {
             out.writeBytes(new byte[DATA_FILE_BYTES], 0, DATA_FILE_BYTES);
+            CodecUtil.writeFooter(out);
+        }
+    }
+
+    private static void writeCentroids(SegmentReadState state, int poisonedAssignmentCount) throws IOException {
+        String name = IndexFileNames.segmentFileName(
+            state.segmentInfo.name,
+            state.segmentSuffix,
+            KNN1030ClusterANNVectorsFormat.CENTROIDS_EXTENSION
+        );
+        try (IndexOutput out = state.directory.createOutput(name, IOContext.DEFAULT)) {
+            for (int assignment = 0; assignment < poisonedAssignmentCount; assignment++) {
+                out.writeInt(Integer.MAX_VALUE);
+            }
+            int remainingBytes = DATA_FILE_BYTES - poisonedAssignmentCount * Integer.BYTES;
+            out.writeBytes(new byte[remainingBytes], 0, remainingBytes);
             CodecUtil.writeFooter(out);
         }
     }

@@ -90,6 +90,26 @@ class CentroidPlannerFilteringTest {
     }
 
     @Test
+    void testPlanFiltered_whenCosine_thenMatchesUnfilteredPlainOrder() throws IOException {
+        // given
+        float[][] centroids = { { 5f, 5f }, { 1f, 0f }, { -1f, 0f } };
+        FixedBitSet acceptedCentroids = new FixedBitSet(centroids.length);
+        acceptedCentroids.set(0, centroids.length);
+        int[] matchCounts = { 100, 1, 50 };
+        Clusters clusters = clusters(VectorSimilarityFunction.COSINE, centroids);
+        PlanParams params = new PlanParams(1, centroids.length);
+        float[] query = { 1f, 0f };
+
+        // when
+        int[] filtered = CentroidPlanner.plan(clusters, query, params, acceptedCentroids, matchCounts);
+        int[] unfiltered = CentroidPlanner.plan(clusters, query, params);
+
+        // then
+        assertArrayEquals(unfiltered, filtered);
+        assertArrayEquals(new int[] { 1, 0, 2 }, filtered);
+    }
+
+    @Test
     void testPlanFiltered_whenAllClustersMatch_thenUsesUnfilteredMaxProbesAndOrder() throws IOException {
         // given
         float[][] centroids = new float[64][DIMENSION];
