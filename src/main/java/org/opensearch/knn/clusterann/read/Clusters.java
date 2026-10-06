@@ -6,10 +6,8 @@
 package org.opensearch.knn.clusterann.read;
 
 import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
-import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
-import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.LongValues;
 import org.opensearch.knn.clusterann.read.orchestration.ClusterScan;
 import org.opensearch.knn.clusterann.read.orchestration.ScanContext;
@@ -18,6 +16,7 @@ import org.opensearch.knn.clusterann.format.rotation.RotationFormats;
 
 import org.opensearch.common.Nullable;
 import java.io.IOException;
+import java.util.function.IntUnaryOperator;
 
 import static org.opensearch.knn.clusterann.read.CentroidVectorValues.floatsPerCentroid;
 
@@ -99,34 +98,15 @@ public final class Clusters {
     }
 
     /**
-     * Query-scoped centroid matches derived from this field's per-ordinal region-1 primary assignments.
-     *
-     * @param acceptedOrds ord-space filter membership, iterated by set bit
-     * @return centroids with an accepted primary assignment and their per-centroid primary match counts
+     * Read-only primary centroid assignment for each vector ordinal, loaded from region 1 of this field's
+     * {@code .clac} data.
      */
-    public CentroidMatches centroidMatches(FixedBitSet acceptedOrds) throws IOException {
-        if (acceptedOrds == null) {
-            throw new IllegalArgumentException("acceptedOrds must be non-null");
-        }
-
-        final int[] matchCounts = new int[fieldMeta.centroidCount()];
-        final FixedBitSet acceptedCentroids = new FixedBitSet(fieldMeta.centroidCount());
-        if (fieldMeta.vectorCount() == 0 || fieldMeta.centroidCount() == 0) {
-            return new CentroidMatches(acceptedCentroids, matchCounts);
-        }
-
+    public IntUnaryOperator ordToCentroid() throws IOException {
         final int[] ordToCentroid = new int[fieldMeta.vectorCount()];
         final IndexInput assignments = ordToCentroidBase.clone();
         assignments.seek(0L);
         assignments.readInts(ordToCentroid, 0, ordToCentroid.length);
-
-        for (int ord = acceptedOrds.nextSetBit(0); ord != DocIdSetIterator.NO_MORE_DOCS && ord < ordToCentroid.length; ord = ord
-            + 1 < acceptedOrds.length() ? acceptedOrds.nextSetBit(ord + 1) : DocIdSetIterator.NO_MORE_DOCS) {
-            final int centroid = ordToCentroid[ord];
-            acceptedCentroids.set(centroid);
-            matchCounts[centroid]++;
-        }
-        return new CentroidMatches(acceptedCentroids, matchCounts);
+        return ordinal -> ordToCentroid[ordinal];
     }
 
     /** Number of vectors in this field, across all clusters. */
@@ -165,9 +145,6 @@ public final class Clusters {
      */
     public Cluster get(int ordinal) throws IOException {
         return clusterFactory.create(ordinal);
-    }
-
-    public record CentroidMatches(FixedBitSet acceptedCentroids, int[] matchCounts) {
     }
 
     private static LongValues ordToDoc(OrdToDocDISIReaderConfiguration config, IndexInput postings) throws IOException {

@@ -31,9 +31,9 @@ import org.opensearch.knn.clusterann.write.CentroidsWriter.CentroidOffsets;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.IntUnaryOperator;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -168,61 +168,17 @@ class ClustersTests {
     }
 
     @Test
-    void testCentroidMatches_thenCountsAcceptedOrdinalsPerCentroidFromRegion1() throws IOException {
+    void testOrdToCentroid_thenReturnsPrimaryAssignmentsFromRegion1() throws IOException {
         // given
         int[] ordToCentroid = { 0, 1, 2, 1, 0, 2, 2, 1, 0, 2, 1, 0, 0, 1, 2, 2, 1, 0, 1 };
-        FixedBitSet acceptedOrds = new FixedBitSet(VECTOR_COUNT);
-        acceptedOrds.set(1);
-        acceptedOrds.set(2);
-        acceptedOrds.set(3);
-        acceptedOrds.set(4);
-        acceptedOrds.set(6);
-        acceptedOrds.set(12);
-        acceptedOrds.set(14);
 
         // when
-        Clusters.CentroidMatches matches = clustersWithAssignments(ordToCentroid).centroidMatches(acceptedOrds);
+        IntUnaryOperator assignments = clustersWithAssignments(ordToCentroid).ordToCentroid();
 
         // then
-        assertEquals(2, matches.matchCounts()[0]);
-        assertEquals(2, matches.matchCounts()[1]);
-        assertEquals(3, matches.matchCounts()[2]);
-        assertTrue(matches.acceptedCentroids().get(0));
-        assertTrue(matches.acceptedCentroids().get(1));
-        assertTrue(matches.acceptedCentroids().get(2));
-        assertEquals(3, matches.acceptedCentroids().cardinality());
-    }
-
-    @Test
-    void testCentroidMatches_whenLastOrdinalAcceptedAtMultipleOf64_thenCountsItWithoutThrowing() throws IOException {
-        // given
-        int[] ordToCentroid = new int[128];
-        ordToCentroid[ordToCentroid.length - 1] = 2;
-        FixedBitSet acceptedOrds = new FixedBitSet(ordToCentroid.length);
-        acceptedOrds.set(ordToCentroid.length - 1);
-
-        // when
-        Clusters.CentroidMatches matches = clustersWithAssignments(ordToCentroid).centroidMatches(acceptedOrds);
-
-        // then
-        assertEquals(1, matches.matchCounts()[2]);
-        assertTrue(matches.acceptedCentroids().get(2));
-    }
-
-    @Test
-    void testCentroidMatches_whenClusterMatchIsOnlyASecondary_thenDoesNotIncludeIt() throws IOException {
-        // given
-        int[] ordToCentroid = new int[VECTOR_COUNT];
-        FixedBitSet acceptedOrds = new FixedBitSet(VECTOR_COUNT);
-        acceptedOrds.set(0);
-
-        // when
-        Clusters.CentroidMatches matches = clustersWithAssignmentsAndSecondary(ordToCentroid).centroidMatches(acceptedOrds);
-
-        // then
-        assertEquals(1, matches.matchCounts()[0], "primary assignment");
-        assertEquals(0, matches.matchCounts()[2], "SOAR secondary assignment");
-        assertFalse(matches.acceptedCentroids().get(2), "a secondary-only match must not make the cluster eligible");
+        for (int ordinal = 0; ordinal < ordToCentroid.length; ordinal++) {
+            assertEquals(ordToCentroid[ordinal], assignments.applyAsInt(ordinal), "ordinal " + ordinal);
+        }
     }
 
     // ---------------------------------------------------------------- scan
@@ -332,46 +288,6 @@ class ClustersTests {
             fixture.input(),
             fieldMeta(VectorSimilarityFunction.EUCLIDEAN, ordToCentroid.length, fixture.length(), fixture.offsets().clacCentroidsOffset())
         );
-    }
-
-    private Clusters clustersWithAssignmentsAndSecondary(int[] ordToCentroid) throws IOException {
-        ClacFixture fixture = clacWithAssignments(ordToCentroid);
-        return new Clusters(
-            clapWithSecondary(),
-            fixture.input(),
-            null,
-            fieldMeta(VectorSimilarityFunction.EUCLIDEAN, ordToCentroid.length, fixture.length(), fixture.offsets().clacCentroidsOffset())
-        );
-    }
-
-    private IndexInput clapWithSecondary() throws IOException {
-        Directory directory = new ByteBuffersDirectory();
-        directories.add(directory);
-        try (IndexOutput out = directory.createOutput("clap-secondary", IOContext.DEFAULT)) {
-            writePosting(out, new int[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }, -1, CENTROID_LENGTHS[0]);
-            writePosting(out, new int[] { 10, 11, 12, 13, 14, 15 }, -1, CENTROID_LENGTHS[1]);
-            writePosting(out, new int[] { 0, 17, 18 }, 0, CENTROID_LENGTHS[2]);
-        }
-        return directory.openInput("clap-secondary", IOContext.DEFAULT);
-    }
-
-    private static void writePosting(IndexOutput out, int[] ordinals, int secondaryPosition, int length) throws IOException {
-        final long start = out.getFilePointer();
-        for (int ordinal : ordinals) {
-            out.writeInt(ordinal);
-        }
-        final FixedBitSet secondaries = new FixedBitSet(ordinals.length);
-        if (secondaryPosition >= 0) {
-            secondaries.set(secondaryPosition);
-        }
-        for (long bits : secondaries.getBits()) {
-            out.writeLong(bits);
-        }
-        for (int ignored : ordinals) {
-            out.writeInt(0);
-        }
-        final int padding = Math.toIntExact(length - (out.getFilePointer() - start));
-        out.writeBytes(new byte[padding], 0, padding);
     }
 
     private ClacFixture clacWithAssignments(int[] ordToCentroid) throws IOException {

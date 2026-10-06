@@ -125,12 +125,9 @@ class ClusterANNFieldMetaTests {
 
     // ---------------------------------------------------------------- emptiness
 
-    /**
-     * Emptiness is about vectors, not clusters: a field with vectors is not empty even if the entry claims no
-     * clusters for them, since the offsets it carries still locate real data.
-     */
+    /** Emptiness follows the vector count for every valid field shape. */
     @ParameterizedTest(name = "{0} vectors in {1} clusters")
-    @CsvSource({ "0, 0, true", "1, 1, false", "30, 3, false", "30, 0, false" })
+    @CsvSource({ "0, 0, true", "1, 1, false", "30, 3, false" })
     void testIsEmpty_thenFollowsVectorCountAlone(int vectorCount, int centroidCount, boolean expectedEmpty) throws IOException {
         // given / when
         ClusterANNFieldMeta meta = read(new ClusterANNFieldMetaEncoder().vectorCount(vectorCount).centroidCount(centroidCount));
@@ -281,7 +278,7 @@ class ClusterANNFieldMetaTests {
      * before the sized arrays are read is what stops a corrupt count from driving a huge allocation.
      */
     @ParameterizedTest(name = "{0} clusters over {1} vectors")
-    @CsvSource({ "4, 3", "1, 0", "-1, 10" })
+    @CsvSource({ "4, 3", "1, 0", "0, 1", "-1, 10" })
     void testRead_whenCentroidCountCannotBeTrue_thenThrows(int centroidCount, int vectorCount) {
         // given / when
         CorruptIndexException e = assertThrows(
@@ -290,7 +287,11 @@ class ClusterANNFieldMetaTests {
         );
 
         // then
-        assertTrue(e.getMessage().contains("centroidCount must be in [0, " + vectorCount + "], got: " + centroidCount), e.getMessage());
+        final int minCentroidCount = vectorCount == 0 ? 0 : 1;
+        assertTrue(
+            e.getMessage().contains("centroidCount must be in [" + minCentroidCount + ", " + vectorCount + "], got: " + centroidCount),
+            e.getMessage()
+        );
     }
 
     /**

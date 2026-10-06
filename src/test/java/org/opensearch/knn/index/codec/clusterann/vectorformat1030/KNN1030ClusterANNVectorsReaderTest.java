@@ -152,6 +152,14 @@ class KNN1030ClusterANNVectorsReaderTest {
     }
 
     @Test
+    void constructor_throws_whenNonEmptyFieldHasNoCentroids() {
+        assertThrows(
+            CorruptIndexException.class,
+            () -> openReader(floatVectorField(DIMENSION, SIMILARITY), validEntry().vectorCount(1).centroidCount(0))
+        );
+    }
+
+    @Test
     void constructor_throws_whenEntryNamesAFieldTheSegmentDoesNotHave() {
         final int unknown = FIELD_NUMBER + 7;
         final CorruptIndexException e = assertThrows(

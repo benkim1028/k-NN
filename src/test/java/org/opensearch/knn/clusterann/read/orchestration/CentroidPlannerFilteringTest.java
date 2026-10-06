@@ -30,7 +30,6 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
@@ -53,7 +52,7 @@ class CentroidPlannerFilteringTest {
     void testPlanWithFilter_whenNull_thenMatchesUnfilteredPath() throws IOException {
         // given
         float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 3f, 0f } };
-        Clusters clusters = clusters(centroids);
+        Clusters clusters = spy(clusters(centroids));
         PlanParams params = new PlanParams(1, centroids.length);
         float[] query = { 0f, 0f };
 
@@ -63,25 +62,22 @@ class CentroidPlannerFilteringTest {
 
         // then
         assertArrayEquals(expected, actual);
+        verify(clusters, never()).ordToCentroid();
     }
 
     @Test
-    void testPlanWithFilter_whenRestrictive_thenMatchesTwoStepPath() throws IOException {
+    void testPlanWithFilter_whenRestrictive_thenPlansEligibleCentroids() throws IOException {
         // given
         float[][] centroids = { { 1f, 0f }, { (float) Math.sqrt(2d), 0f }, { 0.1f, 0f } };
-        FixedBitSet acceptedCentroids = acceptedCentroids(0, 1);
-        int[] matchCounts = { 1, 1, 0 };
-        Clusters clusters = clustersWithMatches(clusters(centroids), acceptedCentroids, matchCounts);
+        Clusters clusters = clusters(centroids);
         FixedBitSet acceptedOrds = acceptedOrds(0, CLUSTER_SIZES[0]);
         PlanParams params = new PlanParams(1, centroids.length);
         float[] query = { 0f, 0f };
 
         // when
         int[] actual = CentroidPlanner.plan(clusters, query, params, acceptedOrds);
-        int[] expected = twoStepPlan(clusters, query, params, acceptedOrds);
 
         // then
-        assertArrayEquals(expected, actual);
         assertArrayEquals(new int[] { 0, 1 }, actual);
     }
 
@@ -101,24 +97,22 @@ class CentroidPlannerFilteringTest {
 
         // then
         assertArrayEquals(expected, actual);
-        verify(clusters, never()).centroidMatches(acceptedOrds);
+        verify(clusters, never()).ordToCentroid();
     }
 
     @Test
-    void testPlanWithFilter_whenNoClusterMatches_thenMatchesTwoStepPath() throws IOException {
+    void testPlanWithFilter_whenNoClusterMatches_thenPlansNothing() throws IOException {
         // given
         float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 3f, 0f } };
-        Clusters clusters = clustersWithMatches(clusters(centroids), new FixedBitSet(centroids.length), new int[centroids.length]);
+        Clusters clusters = clusters(centroids);
         FixedBitSet acceptedOrds = new FixedBitSet(Arrays.stream(CLUSTER_SIZES).sum());
         PlanParams params = new PlanParams(1, centroids.length);
         float[] query = { 0f, 0f };
 
         // when
         int[] actual = CentroidPlanner.plan(clusters, query, params, acceptedOrds);
-        int[] expected = twoStepPlan(clusters, query, params, acceptedOrds);
 
         // then
-        assertArrayEquals(expected, actual);
         assertArrayEquals(new int[0], actual);
     }
 
@@ -126,13 +120,11 @@ class CentroidPlannerFilteringTest {
     void testPlanWithFilter_whenMaximumInnerProduct_thenRanksByPlainInnerProduct() throws IOException {
         // given
         float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 0.1f, 0f } };
-        FixedBitSet acceptedCentroids = acceptedCentroids(0, 1);
-        int[] matchCounts = { 1, 1, 0 };
         FixedBitSet acceptedOrds = acceptedOrds(0, CLUSTER_SIZES[0]);
 
         // when
         int[] probes = CentroidPlanner.plan(
-            clustersWithMatches(clusters(VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT, centroids), acceptedCentroids, matchCounts),
+            clusters(VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT, centroids),
             new float[] { 1f, 0f },
             new PlanParams(1, centroids.length),
             acceptedOrds
@@ -185,48 +177,71 @@ class CentroidPlannerFilteringTest {
     }
 
     @Test
-    void testPlanFiltered_whenLastCentroidAcceptedAtMultipleOf64_thenIncludesItWithoutThrowing() throws IOException {
+    void testPlanFiltered_whenLastOrdinalAcceptedAtMultipleOf64_thenIncludesItsPrimaryCentroid() throws IOException {
         // given
-        float[][] centroids = new float[64][DIMENSION];
-        int[] clusterSizes = new int[centroids.length];
-        Arrays.fill(clusterSizes, 1);
-        FixedBitSet acceptedOrds = new FixedBitSet(centroids.length);
-        acceptedOrds.set(centroids.length - 1);
-        FixedBitSet acceptedCentroids = acceptedCentroids(centroids.length - 1);
-        int[] matchCounts = new int[centroids.length];
-        matchCounts[centroids.length - 1] = 1;
+        float[][] centroids = { { 2f, 0f }, { 1f, 0f }, { 3f, 0f } };
+        int[] ordToCentroid = new int[128];
+        ordToCentroid[ordToCentroid.length - 1] = 2;
+        int[] clusterSizes = { 127, 0, 1 };
+        FixedBitSet acceptedOrds = new FixedBitSet(ordToCentroid.length);
+        acceptedOrds.set(ordToCentroid.length - 1);
 
         // when
         int[] probes = CentroidPlanner.plan(
-            clustersWithMatches(clusters(centroids, clusterSizes), acceptedCentroids, matchCounts),
+            clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, clusterSizes, ordToCentroid, open("clap", 3000)),
             new float[] { 0f, 0f },
             new PlanParams(1, centroids.length),
             acceptedOrds
         );
 
         // then
-        assertArrayEquals(new int[] { centroids.length - 1 }, probes);
+        assertArrayEquals(new int[] { 2 }, probes);
     }
 
-    private static int[] twoStepPlan(Clusters clusters, float[] query, PlanParams params, FixedBitSet acceptedOrds) throws IOException {
-        Clusters.CentroidMatches matches = clusters.centroidMatches(acceptedOrds);
-        return CentroidPlanner.plan(clusters, query, params, matches.acceptedCentroids(), matches.matchCounts());
+    @Test
+    void testPlanFiltered_thenGetsEligibilityFromPrimaryRegion1Assignments() throws IOException {
+        // given
+        float[][] centroids = { { 2f, 0f }, { 3f, 0f }, { 1f, 0f } };
+        int[] ordToCentroid = { 0, 1, 2, 1, 0, 2, 2, 1, 0, 2, 1, 0, 0, 1, 2, 2, 1, 0, 1 };
+        FixedBitSet acceptedOrds = new FixedBitSet(ordToCentroid.length);
+        acceptedOrds.set(1);
+        acceptedOrds.set(2);
+        acceptedOrds.set(3);
+        acceptedOrds.set(4);
+        acceptedOrds.set(6);
+        acceptedOrds.set(12);
+        acceptedOrds.set(14);
+
+        // when
+        int[] probes = CentroidPlanner.plan(
+            clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, new int[] { 7, 6, 6 }, ordToCentroid, open("clap", 3000)),
+            new float[] { 0f, 0f },
+            new PlanParams(1, centroids.length),
+            acceptedOrds
+        );
+
+        // then
+        assertArrayEquals(new int[] { 2, 0, 1 }, probes);
     }
 
-    private static Clusters clustersWithMatches(Clusters clusters, FixedBitSet acceptedCentroids, int[] matchCounts) throws IOException {
-        Clusters stubbed = spy(clusters);
-        doReturn(new Clusters.CentroidMatches(acceptedCentroids, matchCounts)).when(stubbed)
-            .centroidMatches(org.mockito.ArgumentMatchers.any());
-        return stubbed;
-    }
+    @Test
+    void testPlanFiltered_whenMatchIsOnlyASecondary_thenDoesNotMakeThatCentroidEligible() throws IOException {
+        // given
+        float[][] centroids = { { 2f, 0f }, { 3f, 0f }, { 1f, 0f } };
+        int[] ordToCentroid = new int[19];
+        FixedBitSet acceptedOrds = new FixedBitSet(ordToCentroid.length);
+        acceptedOrds.set(0);
 
-    private static FixedBitSet acceptedCentroids(int... ordinals) {
-        int length = Arrays.stream(ordinals).max().orElse(-1) + 1;
-        FixedBitSet acceptedCentroids = new FixedBitSet(Math.max(CLUSTER_SIZES.length, length));
-        for (int ordinal : ordinals) {
-            acceptedCentroids.set(ordinal);
-        }
-        return acceptedCentroids;
+        // when
+        int[] probes = CentroidPlanner.plan(
+            clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, new int[] { 10, 6, 3 }, ordToCentroid, clapWithSecondary()),
+            new float[] { 0f, 0f },
+            new PlanParams(1, centroids.length),
+            acceptedOrds
+        );
+
+        // then
+        assertArrayEquals(new int[] { 0 }, probes);
     }
 
     private static FixedBitSet acceptedOrds(int... ordinals) {
@@ -256,13 +271,53 @@ class CentroidPlannerFilteringTest {
             Arrays.fill(ordToCentroid, vectorOrdinal, vectorOrdinal + clusterSizes[centroidOrdinal], centroidOrdinal);
             vectorOrdinal += clusterSizes[centroidOrdinal];
         }
+        return clusters(similarity, centroids, clusterSizes, ordToCentroid, open("clap", 3000));
+    }
+
+    private Clusters clusters(
+        VectorSimilarityFunction similarity,
+        float[][] centroids,
+        int[] clusterSizes,
+        int[] ordToCentroid,
+        IndexInput postings
+    ) throws IOException {
         ClacFixture clac = clac(centroids, ordToCentroid);
         return new Clusters(
-            open("clap", 3000),
+            postings,
             clac.input(),
             null,
             fieldMeta(similarity, ordToCentroid.length, clac.length(), clac.offsets().clacCentroidsOffset(), clusterSizes)
         );
+    }
+
+    private IndexInput clapWithSecondary() throws IOException {
+        Directory directory = new ByteBuffersDirectory();
+        directories.add(directory);
+        try (IndexOutput out = directory.createOutput("clap-secondary", IOContext.DEFAULT)) {
+            writePosting(out, new int[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }, -1, 1000);
+            writePosting(out, new int[] { 10, 11, 12, 13, 14, 15 }, -1, 1000);
+            writePosting(out, new int[] { 0, 17, 18 }, 0, 1000);
+        }
+        return directory.openInput("clap-secondary", IOContext.DEFAULT);
+    }
+
+    private static void writePosting(IndexOutput out, int[] ordinals, int secondaryPosition, int length) throws IOException {
+        final long start = out.getFilePointer();
+        for (int ordinal : ordinals) {
+            out.writeInt(ordinal);
+        }
+        final FixedBitSet secondaries = new FixedBitSet(ordinals.length);
+        if (secondaryPosition >= 0) {
+            secondaries.set(secondaryPosition);
+        }
+        for (long bits : secondaries.getBits()) {
+            out.writeLong(bits);
+        }
+        for (int ignored : ordinals) {
+            out.writeInt(0);
+        }
+        final int padding = Math.toIntExact(length - (out.getFilePointer() - start));
+        out.writeBytes(new byte[padding], 0, padding);
     }
 
     private ClacFixture clac(float[][] centroids, int[] ordToCentroid) throws IOException {

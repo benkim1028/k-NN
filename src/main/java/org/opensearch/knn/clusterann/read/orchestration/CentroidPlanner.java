@@ -14,6 +14,7 @@ import org.opensearch.knn.clusterann.read.CentroidVectorValues;
 import org.opensearch.knn.clusterann.read.Clusters;
 
 import java.io.IOException;
+import java.util.function.IntUnaryOperator;
 
 /**
  * Chooses which clusters a query should visit.
@@ -45,12 +46,18 @@ public final class CentroidPlanner {
      */
     public static int[] plan(Clusters clusters, float[] query, PlanParams params, FixedBitSet acceptedOrds) throws IOException {
         if (acceptedOrds == null
+            || clusters.numClusters() == 0
             || (acceptedOrds.length() == clusters.numVectors() && acceptedOrds.cardinality() == clusters.numVectors())) {
             return plan(clusters, query, params);
         }
 
-        final Clusters.CentroidMatches centroidMatches = clusters.centroidMatches(acceptedOrds);
-        return plan(clusters, query, params, centroidMatches.acceptedCentroids(), centroidMatches.matchCounts());
+        final IntUnaryOperator ordToCentroid = clusters.ordToCentroid();
+        final FixedBitSet acceptedCentroids = new FixedBitSet(clusters.numClusters());
+        for (int ord = acceptedOrds.nextSetBit(0); ord != DocIdSetIterator.NO_MORE_DOCS && ord < clusters.numVectors(); ord = ord
+            + 1 < acceptedOrds.length() ? acceptedOrds.nextSetBit(ord + 1) : DocIdSetIterator.NO_MORE_DOCS) {
+            acceptedCentroids.set(ordToCentroid.applyAsInt(ord));
+        }
+        return planEligible(clusters, query, params, acceptedCentroids);
     }
 
     /**
@@ -87,18 +94,11 @@ public final class CentroidPlanner {
     }
 
     /** Rank only the centroids the filter reaches, using the same plain distance key as unfiltered planning. */
-    static int[] plan(Clusters clusters, float[] query, PlanParams params, FixedBitSet acceptedCentroids, int[] matchCounts)
+    private static int[] planEligible(Clusters clusters, float[] query, PlanParams params, FixedBitSet acceptedCentroids)
         throws IOException {
-        if (acceptedCentroids == null || matchCounts == null) {
-            throw new IllegalArgumentException("acceptedCentroids and matchCounts must be non-null");
-        }
-
         int numClusters = clusters.numClusters();
         if (numClusters == 0 || acceptedCentroids.cardinality() == 0) {
             return NO_PROBES;
-        }
-        if (matchCounts.length < numClusters) {
-            throw new IllegalArgumentException("matchCounts must cover every cluster");
         }
 
         final VectorSimilarityFunction similarity = clusters.clusterMeta().similarityFunction();
@@ -108,7 +108,7 @@ public final class CentroidPlanner {
         final NeighborQueue nearest = new NeighborQueue(params.maxProbes(), true);
         for (int ordinal = acceptedCentroids.nextSetBit(0); ordinal != DocIdSetIterator.NO_MORE_DOCS && ordinal < numClusters; ordinal =
             ordinal + 1 < acceptedCentroids.length() ? acceptedCentroids.nextSetBit(ordinal + 1) : DocIdSetIterator.NO_MORE_DOCS) {
-            if (clusters.clusterSize(ordinal) != 0 && matchCounts[ordinal] > 0) {
+            if (clusters.clusterSize(ordinal) != 0) {
                 final float[] centroid = centroids.vectorValue(ordinal);
                 nearest.insertWithOverflow(ordinal, distanceKey(similarity, query, queryNormSq, centroid, centroids));
             }
