@@ -99,10 +99,10 @@ public final class Clusters {
     }
 
     /**
-     * Query-scoped centroid matches derived from this field's per-ordinal region-1 assignments.
+     * Query-scoped centroid matches derived from this field's per-ordinal region-1 primary assignments.
      *
      * @param acceptedOrds ord-space filter membership, iterated by set bit
-     * @return centroids touched by the filter and their per-centroid match counts
+     * @return centroids with an accepted primary assignment and their per-centroid primary match counts
      */
     public CentroidMatches centroidMatches(FixedBitSet acceptedOrds) throws IOException {
         if (acceptedOrds == null) {
@@ -125,16 +125,6 @@ public final class Clusters {
             final int centroid = ordToCentroid[ord];
             acceptedCentroids.set(centroid);
             matchCounts[centroid]++;
-        }
-        for (int centroid = 0; centroid < matchCounts.length; centroid++) {
-            if (clusterSize(centroid) == 0) {
-                continue;
-            }
-            final int secondaryMatches = get(centroid).countAcceptedSecondaries(acceptedOrds);
-            if (secondaryMatches > 0) {
-                acceptedCentroids.set(centroid);
-                matchCounts[centroid] += secondaryMatches;
-            }
         }
         return new CentroidMatches(acceptedCentroids, matchCounts);
     }

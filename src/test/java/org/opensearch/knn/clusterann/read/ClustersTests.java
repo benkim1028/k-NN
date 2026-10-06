@@ -33,6 +33,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -209,7 +210,7 @@ class ClustersTests {
     }
 
     @Test
-    void testCentroidMatches_whenClusterMatchIsOnlyASecondary_thenIncludesIt() throws IOException {
+    void testCentroidMatches_whenClusterMatchIsOnlyASecondary_thenDoesNotIncludeIt() throws IOException {
         // given
         int[] ordToCentroid = new int[VECTOR_COUNT];
         FixedBitSet acceptedOrds = new FixedBitSet(VECTOR_COUNT);
@@ -220,8 +221,8 @@ class ClustersTests {
 
         // then
         assertEquals(1, matches.matchCounts()[0], "primary assignment");
-        assertEquals(1, matches.matchCounts()[2], "SOAR secondary assignment");
-        assertTrue(matches.acceptedCentroids().get(2), "a secondary-only match makes the cluster eligible");
+        assertEquals(0, matches.matchCounts()[2], "SOAR secondary assignment");
+        assertFalse(matches.acceptedCentroids().get(2), "a secondary-only match must not make the cluster eligible");
     }
 
     // ---------------------------------------------------------------- scan

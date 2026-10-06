@@ -120,29 +120,6 @@ public class ScalarQuantizedCluster implements Cluster {
     }
 
     @Override
-    public int countAcceptedSecondaries(Bits acceptedOrds) throws IOException {
-        if (acceptedOrds == null) {
-            throw new IllegalArgumentException("acceptedOrds must be non-null");
-        }
-
-        final IndexInput header = posting.clone();
-        header.seek(0L);
-        final int[] postingOrdinals = new int[clusterSize];
-        header.readInts(postingOrdinals, 0, clusterSize);
-        final long[] secondaryBits = new long[FixedBitSet.bits2words(clusterSize)];
-        header.readLongs(secondaryBits, 0, secondaryBits.length);
-
-        int acceptedCount = 0;
-        for (int position = 0; position < clusterSize; position++) {
-            final long mask = 1L << (position & 63);
-            if ((secondaryBits[position >>> 6] & mask) != 0 && acceptedOrds.get(postingOrdinals[position])) {
-                acceptedCount++;
-            }
-        }
-        return acceptedCount;
-    }
-
-    @Override
     public void prefetch(boolean partial) throws IOException {
         if (partial) {
             posting.prefetch(0, headerBytes);
