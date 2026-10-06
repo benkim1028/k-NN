@@ -76,7 +76,7 @@ class CentroidPlannerTests {
         Clusters clusters = clusters(VectorSimilarityFunction.EUCLIDEAN, CENTROIDS, ALL_OCCUPIED);
 
         // when
-        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 4));
+        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 4), null);
 
         // then
         assertArrayEquals(new int[] { 1, 2, 3, 0 }, probes);
@@ -91,7 +91,7 @@ class CentroidPlannerTests {
         // when / then
         IllegalStateException e = assertThrows(
             IllegalStateException.class,
-            () -> CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 4))
+            () -> CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 4), null)
         );
         assertTrue(e.getMessage().contains("MAXIMUM_INNER_PRODUCT"), e.getMessage());
     }
@@ -106,7 +106,7 @@ class CentroidPlannerTests {
         Clusters clusters = clusters(VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT, CENTROIDS, ALL_OCCUPIED);
 
         // when
-        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 4));
+        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 4), null);
 
         // then
         assertArrayEquals(new int[] { 0, 2, 3, 1 }, probes);
@@ -124,11 +124,17 @@ class CentroidPlannerTests {
         int[] occupied = { 4, 4 };
 
         // when
-        int[] byCosine = CentroidPlanner.plan(clusters(VectorSimilarityFunction.COSINE, centroids, occupied), QUERY, new PlanParams(1, 2));
+        int[] byCosine = CentroidPlanner.plan(
+            clusters(VectorSimilarityFunction.COSINE, centroids, occupied),
+            QUERY,
+            new PlanParams(1, 2),
+            null
+        );
         int[] byDot = CentroidPlanner.plan(
             clusters(VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT, centroids, occupied),
             QUERY,
-            new PlanParams(1, 2)
+            new PlanParams(1, 2),
+            null
         );
 
         // then
@@ -144,7 +150,7 @@ class CentroidPlannerTests {
         float[] query = QUERY.clone();
 
         // when
-        CentroidPlanner.plan(clusters, query, new PlanParams(1, 4));
+        CentroidPlanner.plan(clusters, query, new PlanParams(1, 4), null);
 
         // then
         assertArrayEquals(QUERY, query);
@@ -159,7 +165,7 @@ class CentroidPlannerTests {
         Clusters clusters = clusters(VectorSimilarityFunction.EUCLIDEAN, CENTROIDS, ALL_OCCUPIED);
 
         // when
-        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 2));
+        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 2), null);
 
         // then
         assertArrayEquals(new int[] { 1, 2 }, probes, "the two closest, still closest-first");
@@ -172,7 +178,7 @@ class CentroidPlannerTests {
         Clusters clusters = clusters(VectorSimilarityFunction.EUCLIDEAN, CENTROIDS, ALL_OCCUPIED);
 
         // when
-        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 100));
+        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 100), null);
 
         // then
         assertArrayEquals(new int[] { 1, 2, 3, 0 }, probes);
@@ -189,7 +195,7 @@ class CentroidPlannerTests {
         PlanParams params = new PlanParams(4, 10);
 
         // when
-        int[] probes = CentroidPlanner.plan(clusters, QUERY, params);
+        int[] probes = CentroidPlanner.plan(clusters, QUERY, params, null);
 
         // then
         assertTrue(probes.length >= params.minProbes(), "got " + probes.length);
@@ -202,7 +208,7 @@ class CentroidPlannerTests {
         Clusters clusters = clusters(VectorSimilarityFunction.EUCLIDEAN, CENTROIDS, new int[] { 4, 0, 4, 4 });
 
         // when
-        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(4, 10));
+        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(4, 10), null);
 
         // then
         assertEquals(3, probes.length, "three occupied clusters, and a floor of four does not invent a fourth");
@@ -221,7 +227,7 @@ class CentroidPlannerTests {
         Clusters clusters = clusters(VectorSimilarityFunction.EUCLIDEAN, CENTROIDS, new int[] { 4, 0, 4, 4 });
 
         // when
-        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 2));
+        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 2), null);
 
         // then
         assertArrayEquals(new int[] { 2, 3 }, probes, "the next two closest, with the empty one passed over");
@@ -233,7 +239,7 @@ class CentroidPlannerTests {
         Clusters clusters = clusters(VectorSimilarityFunction.EUCLIDEAN, CENTROIDS, new int[] { 0, 0, 0, 0 });
 
         // when
-        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 4));
+        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 4), null);
 
         // then
         assertEquals(0, probes.length);
@@ -247,7 +253,7 @@ class CentroidPlannerTests {
         when(clusters.numClusters()).thenReturn(0);
 
         // when
-        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 4));
+        int[] probes = CentroidPlanner.plan(clusters, QUERY, new PlanParams(1, 4), null);
 
         // then
         assertEquals(0, probes.length);

@@ -32,7 +32,29 @@ public final class CentroidPlanner {
     private CentroidPlanner() {}
 
     /**
-     * Rank this field's centroids against the query and name the clusters to visit.
+     * Rank this field's centroids against the query and name the clusters to visit, considering only clusters reached
+     * by the ord-space filter when one is present.
+     *
+     * <p>A null or accept-all filter takes the unfiltered path without reading ordinal-to-centroid assignments.
+     *
+     * @param clusters the field's clusters
+     * @param query the query vector, in the space it arrived in; not modified
+     * @param params the bounds to choose within
+     * @param acceptedOrds ord-space filter membership, or null for an unfiltered search
+     * @return centroid ordinals to probe, ordered closest-first; empty if no non-empty cluster matches
+     */
+    public static int[] plan(Clusters clusters, float[] query, PlanParams params, FixedBitSet acceptedOrds) throws IOException {
+        if (acceptedOrds == null
+            || (acceptedOrds.length() == clusters.numVectors() && acceptedOrds.cardinality() == clusters.numVectors())) {
+            return plan(clusters, query, params);
+        }
+
+        final Clusters.CentroidMatches centroidMatches = clusters.centroidMatches(acceptedOrds);
+        return plan(clusters, query, params, centroidMatches.acceptedCentroids(), centroidMatches.matchCounts());
+    }
+
+    /**
+     * Rank every centroid in this field against the query and name the clusters to visit.
      *
      * <p>Costs one pass over the centroid region ({@code numClusters × dimension} floats), before any posting is
      * touched. Empty clusters are dropped during the sweep so they never take up a probe slot.
@@ -44,7 +66,7 @@ public final class CentroidPlanner {
      *
      * TODO: return NeighborQueue directly if possible, waiting it out for inter-cluster pruning strategies to be added
      */
-    public static int[] plan(Clusters clusters, float[] query, PlanParams params) throws IOException {
+    static int[] plan(Clusters clusters, float[] query, PlanParams params) throws IOException {
         int numClusters = clusters.numClusters();
         if (numClusters == 0) {
             return NO_PROBES;
@@ -65,7 +87,7 @@ public final class CentroidPlanner {
     }
 
     /** Rank only the centroids the filter reaches, using the same plain distance key as unfiltered planning. */
-    public static int[] plan(Clusters clusters, float[] query, PlanParams params, FixedBitSet acceptedCentroids, int[] matchCounts)
+    static int[] plan(Clusters clusters, float[] query, PlanParams params, FixedBitSet acceptedCentroids, int[] matchCounts)
         throws IOException {
         if (acceptedCentroids == null || matchCounts == null) {
             throw new IllegalArgumentException("acceptedCentroids and matchCounts must be non-null");

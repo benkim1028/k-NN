@@ -30,6 +30,10 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
 
 class CentroidPlannerFilteringTest {
 
@@ -46,43 +50,92 @@ class CentroidPlannerFilteringTest {
     }
 
     @Test
-    void testPlanFiltered_thenSkipsZeroMatchCentroidsAndRanksByPlainDistance() throws IOException {
+    void testPlanWithFilter_whenNull_thenMatchesUnfilteredPath() throws IOException {
         // given
-        float[][] centroids = { { 1f, 0f }, { (float) Math.sqrt(2d), 0f }, { 0.1f, 0f } };
-        FixedBitSet acceptedCentroids = new FixedBitSet(centroids.length);
-        acceptedCentroids.set(0);
-        acceptedCentroids.set(1);
-        int[] matchCounts = { 1, 10, 0 };
+        float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 3f, 0f } };
+        Clusters clusters = clusters(centroids);
+        PlanParams params = new PlanParams(1, centroids.length);
+        float[] query = { 0f, 0f };
 
         // when
-        int[] probes = CentroidPlanner.plan(
-            clusters(centroids),
-            new float[] { 0f, 0f },
-            new PlanParams(1, centroids.length),
-            acceptedCentroids,
-            matchCounts
-        );
+        int[] actual = CentroidPlanner.plan(clusters, query, params, null);
+        int[] expected = CentroidPlanner.plan(clusters, query, params);
 
         // then
-        assertArrayEquals(new int[] { 0, 1 }, probes);
+        assertArrayEquals(expected, actual);
     }
 
     @Test
-    void testPlanFiltered_whenMaximumInnerProduct_thenRanksByPlainInnerProduct() throws IOException {
+    void testPlanWithFilter_whenRestrictive_thenMatchesTwoStepPath() throws IOException {
+        // given
+        float[][] centroids = { { 1f, 0f }, { (float) Math.sqrt(2d), 0f }, { 0.1f, 0f } };
+        FixedBitSet acceptedCentroids = acceptedCentroids(0, 1);
+        int[] matchCounts = { 1, 1, 0 };
+        Clusters clusters = clustersWithMatches(clusters(centroids), acceptedCentroids, matchCounts);
+        FixedBitSet acceptedOrds = acceptedOrds(0, CLUSTER_SIZES[0]);
+        PlanParams params = new PlanParams(1, centroids.length);
+        float[] query = { 0f, 0f };
+
+        // when
+        int[] actual = CentroidPlanner.plan(clusters, query, params, acceptedOrds);
+        int[] expected = twoStepPlan(clusters, query, params, acceptedOrds);
+
+        // then
+        assertArrayEquals(expected, actual);
+        assertArrayEquals(new int[] { 0, 1 }, actual);
+    }
+
+    @Test
+    void testPlanWithFilter_whenAcceptAll_thenMatchesUnfilteredPath() throws IOException {
+        // given
+        float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 3f, 0f } };
+        Clusters clusters = spy(clusters(centroids));
+        FixedBitSet acceptedOrds = new FixedBitSet(Arrays.stream(CLUSTER_SIZES).sum());
+        acceptedOrds.set(0, acceptedOrds.length());
+        PlanParams params = new PlanParams(1, centroids.length);
+        float[] query = { 0f, 0f };
+
+        // when
+        int[] actual = CentroidPlanner.plan(clusters, query, params, acceptedOrds);
+        int[] expected = CentroidPlanner.plan(clusters, query, params);
+
+        // then
+        assertArrayEquals(expected, actual);
+        verify(clusters, never()).centroidMatches(acceptedOrds);
+    }
+
+    @Test
+    void testPlanWithFilter_whenNoClusterMatches_thenMatchesTwoStepPath() throws IOException {
+        // given
+        float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 3f, 0f } };
+        Clusters clusters = clustersWithMatches(clusters(centroids), new FixedBitSet(centroids.length), new int[centroids.length]);
+        FixedBitSet acceptedOrds = new FixedBitSet(Arrays.stream(CLUSTER_SIZES).sum());
+        PlanParams params = new PlanParams(1, centroids.length);
+        float[] query = { 0f, 0f };
+
+        // when
+        int[] actual = CentroidPlanner.plan(clusters, query, params, acceptedOrds);
+        int[] expected = twoStepPlan(clusters, query, params, acceptedOrds);
+
+        // then
+        assertArrayEquals(expected, actual);
+        assertArrayEquals(new int[0], actual);
+    }
+
+    @Test
+    void testPlanWithFilter_whenMaximumInnerProduct_thenRanksByPlainInnerProduct() throws IOException {
         // given
         float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 0.1f, 0f } };
-        FixedBitSet acceptedCentroids = new FixedBitSet(centroids.length);
-        acceptedCentroids.set(0);
-        acceptedCentroids.set(1);
-        int[] matchCounts = { 10, 1, 0 };
+        FixedBitSet acceptedCentroids = acceptedCentroids(0, 1);
+        int[] matchCounts = { 1, 1, 0 };
+        FixedBitSet acceptedOrds = acceptedOrds(0, CLUSTER_SIZES[0]);
 
         // when
         int[] probes = CentroidPlanner.plan(
-            clusters(VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT, centroids),
+            clustersWithMatches(clusters(VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT, centroids), acceptedCentroids, matchCounts),
             new float[] { 1f, 0f },
             new PlanParams(1, centroids.length),
-            acceptedCentroids,
-            matchCounts
+            acceptedOrds
         );
 
         // then
@@ -93,15 +146,14 @@ class CentroidPlannerFilteringTest {
     void testPlanFiltered_whenCosine_thenMatchesUnfilteredPlainOrder() throws IOException {
         // given
         float[][] centroids = { { 5f, 5f }, { 1f, 0f }, { -1f, 0f } };
-        FixedBitSet acceptedCentroids = new FixedBitSet(centroids.length);
-        acceptedCentroids.set(0, centroids.length);
-        int[] matchCounts = { 100, 1, 50 };
         Clusters clusters = clusters(VectorSimilarityFunction.COSINE, centroids);
+        FixedBitSet acceptedOrds = new FixedBitSet(Arrays.stream(CLUSTER_SIZES).sum());
+        acceptedOrds.set(0, acceptedOrds.length());
         PlanParams params = new PlanParams(1, centroids.length);
         float[] query = { 1f, 0f };
 
         // when
-        int[] filtered = CentroidPlanner.plan(clusters, query, params, acceptedCentroids, matchCounts);
+        int[] filtered = CentroidPlanner.plan(clusters, query, params, acceptedOrds);
         int[] unfiltered = CentroidPlanner.plan(clusters, query, params);
 
         // then
@@ -114,19 +166,17 @@ class CentroidPlannerFilteringTest {
         // given
         float[][] centroids = new float[64][DIMENSION];
         int[] clusterSizes = new int[centroids.length];
-        FixedBitSet acceptedCentroids = new FixedBitSet(centroids.length);
-        int[] matchCounts = new int[centroids.length];
         for (int ordinal = 0; ordinal < centroids.length; ordinal++) {
             centroids[ordinal][0] = ordinal + 1;
             clusterSizes[ordinal] = 1;
-            acceptedCentroids.set(ordinal);
-            matchCounts[ordinal] = ordinal + 1;
         }
         Clusters clusters = clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, clusterSizes);
+        FixedBitSet acceptedOrds = new FixedBitSet(centroids.length);
+        acceptedOrds.set(0, acceptedOrds.length());
         PlanParams params = PlanParams.of(centroids.length);
 
         // when
-        int[] filtered = CentroidPlanner.plan(clusters, new float[DIMENSION], params, acceptedCentroids, matchCounts);
+        int[] filtered = CentroidPlanner.plan(clusters, new float[DIMENSION], params, acceptedOrds);
         int[] unfiltered = CentroidPlanner.plan(clusters, new float[DIMENSION], params);
 
         // then
@@ -138,24 +188,53 @@ class CentroidPlannerFilteringTest {
     void testPlanFiltered_whenLastCentroidAcceptedAtMultipleOf64_thenIncludesItWithoutThrowing() throws IOException {
         // given
         float[][] centroids = new float[64][DIMENSION];
-        FixedBitSet acceptedCentroids = new FixedBitSet(centroids.length);
-        acceptedCentroids.set(centroids.length - 1);
-        int[] matchCounts = new int[centroids.length];
-        matchCounts[centroids.length - 1] = 1;
         int[] clusterSizes = new int[centroids.length];
         Arrays.fill(clusterSizes, 1);
+        FixedBitSet acceptedOrds = new FixedBitSet(centroids.length);
+        acceptedOrds.set(centroids.length - 1);
+        FixedBitSet acceptedCentroids = acceptedCentroids(centroids.length - 1);
+        int[] matchCounts = new int[centroids.length];
+        matchCounts[centroids.length - 1] = 1;
 
         // when
         int[] probes = CentroidPlanner.plan(
-            clusters(centroids, clusterSizes),
+            clustersWithMatches(clusters(centroids, clusterSizes), acceptedCentroids, matchCounts),
             new float[] { 0f, 0f },
             new PlanParams(1, centroids.length),
-            acceptedCentroids,
-            matchCounts
+            acceptedOrds
         );
 
         // then
         assertArrayEquals(new int[] { centroids.length - 1 }, probes);
+    }
+
+    private static int[] twoStepPlan(Clusters clusters, float[] query, PlanParams params, FixedBitSet acceptedOrds) throws IOException {
+        Clusters.CentroidMatches matches = clusters.centroidMatches(acceptedOrds);
+        return CentroidPlanner.plan(clusters, query, params, matches.acceptedCentroids(), matches.matchCounts());
+    }
+
+    private static Clusters clustersWithMatches(Clusters clusters, FixedBitSet acceptedCentroids, int[] matchCounts) throws IOException {
+        Clusters stubbed = spy(clusters);
+        doReturn(new Clusters.CentroidMatches(acceptedCentroids, matchCounts)).when(stubbed)
+            .centroidMatches(org.mockito.ArgumentMatchers.any());
+        return stubbed;
+    }
+
+    private static FixedBitSet acceptedCentroids(int... ordinals) {
+        int length = Arrays.stream(ordinals).max().orElse(-1) + 1;
+        FixedBitSet acceptedCentroids = new FixedBitSet(Math.max(CLUSTER_SIZES.length, length));
+        for (int ordinal : ordinals) {
+            acceptedCentroids.set(ordinal);
+        }
+        return acceptedCentroids;
+    }
+
+    private static FixedBitSet acceptedOrds(int... ordinals) {
+        FixedBitSet acceptedOrds = new FixedBitSet(Arrays.stream(CLUSTER_SIZES).sum());
+        for (int ordinal : ordinals) {
+            acceptedOrds.set(ordinal);
+        }
+        return acceptedOrds;
     }
 
     private Clusters clusters(float[][] centroids) throws IOException {

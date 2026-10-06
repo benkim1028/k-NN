@@ -252,19 +252,7 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
         );
         final FixedBitSet acceptedOrds = buildAcceptedOrds(acceptDocs, ordToDoc, fieldClusters.numVectors());
 
-        final int[] probes;
-        if (acceptedOrds != null) {
-            final Clusters.CentroidMatches centroidMatches = fieldClusters.centroidMatches(acceptedOrds);
-            probes = CentroidPlanner.plan(
-                fieldClusters,
-                query,
-                PlanParams.of(fieldClusters.numClusters()),
-                centroidMatches.acceptedCentroids(),
-                centroidMatches.matchCounts()
-            );
-        } else {
-            probes = CentroidPlanner.plan(fieldClusters, query, PlanParams.of(fieldClusters.numClusters()));
-        }
+        final int[] probes = CentroidPlanner.plan(fieldClusters, query, PlanParams.of(fieldClusters.numClusters()), acceptedOrds);
 
         float[] scanQuery = new float[query.length];
         fieldClusters.rotation().rotate(query, scanQuery);
