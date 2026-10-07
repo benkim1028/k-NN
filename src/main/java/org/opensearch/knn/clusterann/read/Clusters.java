@@ -6,6 +6,8 @@
 package org.opensearch.knn.clusterann.read;
 
 import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
+import org.apache.lucene.codecs.lucene90.IndexedDISI;
+import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.RandomAccessInput;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
@@ -33,6 +35,8 @@ public final class Clusters {
 
     private final ClusterANNFieldMeta fieldMeta;
     private final ClusterFactory clusterFactory;
+    private final IndexInput postings;
+    private final OrdToDocDISIReaderConfiguration ordToDocConfig;
     private final LongValues ordToDoc;
     private final IndexInput ordToCentroidBase;
     private final CentroidVectorValues centroidsBase;
@@ -51,7 +55,9 @@ public final class Clusters {
         final ClusterANNFieldMeta fieldMeta
     ) throws IOException {
         this.fieldMeta = fieldMeta;
-        this.ordToDoc = ordToDoc(fieldMeta.ordToDoc(), postings);
+        this.postings = postings;
+        this.ordToDocConfig = fieldMeta.ordToDoc();
+        this.ordToDoc = ordToDoc(ordToDocConfig, postings);
         this.clusterFactory = new ClusterFactory(fieldMeta, postings, centroids, rotation);
         this.rotation = RotationFormats.read(fieldMeta.rotationId(), rotation, fieldMeta.dimension());
 
@@ -68,6 +74,24 @@ public final class Clusters {
 
     public LongValues ordToDoc() {
         return ordToDoc;
+    }
+
+    /** Whether every document in this segment has this vector field, making document ids equal vector ordinals. */
+    public boolean hasDenseVectorValues() {
+        return ordToDocConfig.isDense();
+    }
+
+    /**
+     * A query-private iterator over the documents that have this vector field, exposing each document's vector ordinal.
+     *
+     * <p>Only sparse fields need this iterator. It reads the field's existing {@link IndexedDISI}; no reverse mapping
+     * is built.
+     */
+    public KnnVectorValues.DocIndexIterator sparseVectorDocs() throws IOException {
+        if (hasDenseVectorValues()) {
+            throw new IllegalStateException("dense vector values use document ids as ordinals");
+        }
+        return IndexedDISI.asDocIndexIterator(ordToDocConfig.getIndexedDISI(postings));
     }
 
     /**

@@ -21,11 +21,14 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.AcceptDocs;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.BitSetIterator;
+import org.apache.lucene.util.Bits;
 import org.apache.lucene.tests.store.MockDirectoryWrapper;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.IOUtils;
@@ -41,6 +44,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -353,10 +357,9 @@ class KNN1030ClusterANNVectorsReaderTest {
             vectorCount
         );
         final KnnCollector collector = mock(KnnCollector.class);
-        final AcceptDocs acceptDocs = mock(AcceptDocs.class);
         final FixedBitSet allDocs = new FixedBitSet(MAX_DOC);
         allDocs.set(0, MAX_DOC);
-        when(acceptDocs.bits()).thenReturn(allDocs);
+        final AcceptDocs acceptDocs = AcceptDocs.fromLiveDocs(allDocs, MAX_DOC);
 
         // when
         assignmentPoisoned.search(FIELD, new float[DIMENSION], collector, acceptDocs);
@@ -364,6 +367,52 @@ class KNN1030ClusterANNVectorsReaderTest {
         // then
         verify(collector, atLeastOnce()).collect(anyInt(), anyFloat());
         verify(raw, never()).getRandomVectorScorer(any(String.class), any(float[].class));
+    }
+
+    @Test
+    void search_whenFilterIsRestrictive_thenDoesNotProbeEveryVectorDocument() throws Exception {
+        // given
+        final KNN1030ClusterANNVectorsReader largeSegment = openReader(
+            floatVectorField(DIMENSION, SIMILARITY),
+            validEntry().vectorCount(MAX_DOC).centroidCount(1).clusterSizes(1).clacCentroidsOffset((long) MAX_DOC * Integer.BYTES)
+        );
+        final FixedBitSet accepted = new FixedBitSet(MAX_DOC);
+        accepted.set(0);
+        final AtomicInteger documentProbes = new AtomicInteger();
+        final Bits countingBits = new Bits() {
+            @Override
+            public boolean get(int index) {
+                documentProbes.incrementAndGet();
+                return accepted.get(index);
+            }
+
+            @Override
+            public int length() {
+                return accepted.length();
+            }
+        };
+        final AcceptDocs acceptDocs = new AcceptDocs() {
+            @Override
+            public Bits bits() {
+                return countingBits;
+            }
+
+            @Override
+            public DocIdSetIterator iterator() {
+                return new BitSetIterator(accepted, accepted.cardinality());
+            }
+
+            @Override
+            public int cost() {
+                return accepted.cardinality();
+            }
+        };
+
+        // when
+        largeSegment.search(FIELD, new float[DIMENSION], mock(KnnCollector.class), acceptDocs);
+
+        // then
+        assertTrue(documentProbes.get() < 10, "restrictive planning probed " + documentProbes.get() + " documents");
     }
 
     /**

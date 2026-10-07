@@ -5,7 +5,10 @@
 
 package org.opensearch.knn.clusterann.read.orchestration;
 
+import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
+import org.apache.lucene.index.DocsWithFieldSet;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
@@ -37,6 +40,7 @@ import static org.mockito.Mockito.verify;
 class CentroidPlannerFilteringTest {
 
     private static final int DIMENSION = 2;
+    private static final int DIRECT_MONOTONIC_BLOCK_SHIFT = 16;
     private static final int[] CLUSTER_SIZES = { 4, 4, 4 };
 
     private final List<Directory> directories = new ArrayList<>();
@@ -75,7 +79,7 @@ class CentroidPlannerFilteringTest {
         float[] query = { 0f, 0f };
 
         // when
-        int[] actual = CentroidPlanner.plan(clusters, query, params, acceptedOrds);
+        int[] actual = CentroidPlanner.plan(clusters, query, params, acceptDocs(acceptedOrds));
 
         // then
         assertArrayEquals(new int[] { 0, 1 }, actual);
@@ -92,7 +96,7 @@ class CentroidPlannerFilteringTest {
         float[] query = { 0f, 0f };
 
         // when
-        int[] actual = CentroidPlanner.plan(clusters, query, params, acceptedOrds);
+        int[] actual = CentroidPlanner.plan(clusters, query, params, acceptDocs(acceptedOrds));
         int[] expected = CentroidPlanner.plan(clusters, query, params);
 
         // then
@@ -110,7 +114,7 @@ class CentroidPlannerFilteringTest {
         float[] query = { 0f, 0f };
 
         // when
-        int[] actual = CentroidPlanner.plan(clusters, query, params, acceptedOrds);
+        int[] actual = CentroidPlanner.plan(clusters, query, params, acceptDocs(acceptedOrds));
 
         // then
         assertArrayEquals(new int[0], actual);
@@ -127,7 +131,7 @@ class CentroidPlannerFilteringTest {
             clusters(VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT, centroids),
             new float[] { 1f, 0f },
             new PlanParams(1, centroids.length),
-            acceptedOrds
+            acceptDocs(acceptedOrds)
         );
 
         // then
@@ -145,7 +149,7 @@ class CentroidPlannerFilteringTest {
         float[] query = { 1f, 0f };
 
         // when
-        int[] filtered = CentroidPlanner.plan(clusters, query, params, acceptedOrds);
+        int[] filtered = CentroidPlanner.plan(clusters, query, params, acceptDocs(acceptedOrds));
         int[] unfiltered = CentroidPlanner.plan(clusters, query, params);
 
         // then
@@ -168,7 +172,7 @@ class CentroidPlannerFilteringTest {
         PlanParams params = PlanParams.of(centroids.length);
 
         // when
-        int[] filtered = CentroidPlanner.plan(clusters, new float[DIMENSION], params, acceptedOrds);
+        int[] filtered = CentroidPlanner.plan(clusters, new float[DIMENSION], params, acceptDocs(acceptedOrds));
         int[] unfiltered = CentroidPlanner.plan(clusters, new float[DIMENSION], params);
 
         // then
@@ -191,7 +195,7 @@ class CentroidPlannerFilteringTest {
             clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, clusterSizes, ordToCentroid, open("clap", 3000)),
             new float[] { 0f, 0f },
             new PlanParams(1, centroids.length),
-            acceptedOrds
+            acceptDocs(acceptedOrds)
         );
 
         // then
@@ -217,11 +221,32 @@ class CentroidPlannerFilteringTest {
             clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, new int[] { 7, 6, 6 }, ordToCentroid, open("clap", 3000)),
             new float[] { 0f, 0f },
             new PlanParams(1, centroids.length),
-            acceptedOrds
+            acceptDocs(acceptedOrds)
         );
 
         // then
         assertArrayEquals(new int[] { 2, 0, 1 }, probes);
+    }
+
+    @Test
+    void testPlanFiltered_whenVectorFieldIsSparse_thenMapsAcceptedDocumentsToVectorOrdinals() throws IOException {
+        // given
+        float[][] centroids = { { 3f, 0f }, { 2f, 0f }, { 1f, 0f } };
+        int[] ordToCentroid = { 0, 2, 1 };
+        int[] vectorDocs = { 1, 4, 7 };
+        FixedBitSet acceptedDocs = new FixedBitSet(8);
+        acceptedDocs.set(4);
+
+        // when
+        int[] probes = CentroidPlanner.plan(
+            sparseClusters(centroids, ordToCentroid, vectorDocs, acceptedDocs.length()),
+            new float[] { 0f, 0f },
+            new PlanParams(1, centroids.length),
+            acceptDocs(acceptedDocs)
+        );
+
+        // then
+        assertArrayEquals(new int[] { 2 }, probes);
     }
 
     @Test
@@ -237,7 +262,7 @@ class CentroidPlannerFilteringTest {
             clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, new int[] { 10, 6, 3 }, ordToCentroid, clapWithSecondary()),
             new float[] { 0f, 0f },
             new PlanParams(1, centroids.length),
-            acceptedOrds
+            acceptDocs(acceptedOrds)
         );
 
         // then
@@ -250,6 +275,10 @@ class CentroidPlannerFilteringTest {
             acceptedOrds.set(ordinal);
         }
         return acceptedOrds;
+    }
+
+    private static AcceptDocs acceptDocs(FixedBitSet acceptedDocs) {
+        return AcceptDocs.fromLiveDocs(acceptedDocs, acceptedDocs.length());
     }
 
     private Clusters clusters(float[][] centroids) throws IOException {
@@ -287,6 +316,46 @@ class CentroidPlannerFilteringTest {
             clac.input(),
             null,
             fieldMeta(similarity, ordToCentroid.length, clac.length(), clac.offsets().clacCentroidsOffset(), clusterSizes)
+        );
+    }
+
+    private Clusters sparseClusters(float[][] centroids, int[] ordToCentroid, int[] vectorDocs, int maxDoc) throws IOException {
+        Directory directory = new ByteBuffersDirectory();
+        directories.add(directory);
+        DocsWithFieldSet docsWithField = new DocsWithFieldSet();
+        for (int doc : vectorDocs) {
+            docsWithField.add(doc);
+        }
+        try (
+            IndexOutput meta = directory.createOutput("sparse-meta", IOContext.DEFAULT);
+            IndexOutput postings = directory.createOutput("sparse-clap", IOContext.DEFAULT)
+        ) {
+            OrdToDocDISIReaderConfiguration.writeStoredMeta(
+                DIRECT_MONOTONIC_BLOCK_SHIFT,
+                meta,
+                postings,
+                vectorDocs.length,
+                maxDoc,
+                docsWithField
+            );
+        }
+        final OrdToDocDISIReaderConfiguration ordToDoc;
+        try (IndexInput meta = directory.openInput("sparse-meta", IOContext.DEFAULT)) {
+            ordToDoc = OrdToDocDISIReaderConfiguration.fromStoredMeta(meta, vectorDocs.length);
+        }
+        ClacFixture clac = clac(centroids, ordToCentroid);
+        return new Clusters(
+            directory.openInput("sparse-clap", IOContext.DEFAULT),
+            clac.input(),
+            null,
+            fieldMeta(
+                VectorSimilarityFunction.EUCLIDEAN,
+                ordToCentroid.length,
+                clac.length(),
+                clac.offsets().clacCentroidsOffset(),
+                new int[] { 1, 1, 1 },
+                ordToDoc
+            )
         );
     }
 
@@ -342,6 +411,24 @@ class CentroidPlannerFilteringTest {
         long clacCentroidsOffset,
         int[] clusterSizes
     ) throws IOException {
+        return fieldMeta(
+            similarity,
+            vectorCount,
+            clacLength,
+            clacCentroidsOffset,
+            clusterSizes,
+            ClusterANNFieldMetaEncoder.denseOrdToDoc(vectorCount)
+        );
+    }
+
+    private static ClusterANNFieldMeta fieldMeta(
+        VectorSimilarityFunction similarity,
+        int vectorCount,
+        long clacLength,
+        long clacCentroidsOffset,
+        int[] clusterSizes,
+        OrdToDocDISIReaderConfiguration ordToDoc
+    ) {
         int centroidCount = clusterSizes.length;
         return new ClusterANNFieldMeta(
             32,
@@ -364,7 +451,7 @@ class CentroidPlannerFilteringTest {
             clusterSizes,
             -1L,
             -1L,
-            ClusterANNFieldMetaEncoder.denseOrdToDoc(vectorCount)
+            ordToDoc
         );
     }
 
