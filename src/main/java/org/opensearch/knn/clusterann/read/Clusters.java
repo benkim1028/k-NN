@@ -26,15 +26,15 @@ import static org.opensearch.knn.clusterann.read.CentroidVectorValues.floatsPerC
  * reused. It has access to all the information of the clusters and acts as an abstraction to navigate and get
  * the information.
  *
- * <p>Immutable and thread-safe. It holds the {@code .clap} input, the immutable {@link ClusterANNFieldMeta}, and a
- * <em>base</em> transformed-centroid reader over {@code .clac}..
+ * <p>Immutable and thread-safe. It holds the {@code .clap} input, the immutable {@link ClusterANNFieldMeta}, and
+ * <em>base</em> assignment and transformed-centroid readers over {@code .clac}.
  */
 public final class Clusters {
 
     private final ClusterANNFieldMeta fieldMeta;
     private final ClusterFactory clusterFactory;
     private final LongValues ordToDoc;
-    private final LongValues ordToCentroid;
+    private final IndexInput ordToCentroidBase;
     private final CentroidVectorValues centroidsBase;
     private final Rotation rotation;
 
@@ -56,17 +56,7 @@ public final class Clusters {
         this.rotation = RotationFormats.read(fieldMeta.rotationId(), rotation, fieldMeta.dimension());
 
         long ordToCentroidBytes = Math.multiplyExact((long) fieldMeta.vectorCount(), Integer.BYTES);
-        final RandomAccessInput assignments = centroids.randomAccessSlice(0L, ordToCentroidBytes);
-        this.ordToCentroid = new LongValues() {
-            @Override
-            public long get(long ordinal) {
-                try {
-                    return assignments.readInt(ordinal * Integer.BYTES);
-                } catch (IOException e) {
-                    throw new UncheckedIOException(e);
-                }
-            }
-        };
+        this.ordToCentroidBase = centroids.slice("ord-to-centroid", 0L, ordToCentroidBytes);
 
         long centroidsBytes = (long) fieldMeta.centroidCount() * floatsPerCentroid(fieldMeta.dimension()) * Float.BYTES;
         this.centroidsBase = new CentroidVectorValues(
@@ -109,11 +99,21 @@ public final class Clusters {
     }
 
     /**
-     * Read-only primary centroid assignment for each vector ordinal, read lazily from region 1 of this field's
-     * {@code .clac} data through positional access.
+     * A query-private, read-only primary centroid assignment lookup over region 1 of this field's {@code .clac} data.
+     * Creating it reads nothing; each assignment is read lazily through positional access.
      */
-    public LongValues ordToCentroid() {
-        return ordToCentroid;
+    public LongValues ordToCentroid() throws IOException {
+        final RandomAccessInput assignments = ordToCentroidBase.randomAccessSlice(0L, ordToCentroidBase.length());
+        return new LongValues() {
+            @Override
+            public long get(long ordinal) {
+                try {
+                    return assignments.readInt(ordinal * Integer.BYTES);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            }
+        };
     }
 
     /** Number of vectors in this field, across all clusters. */

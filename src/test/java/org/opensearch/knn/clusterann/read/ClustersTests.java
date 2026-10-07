@@ -11,6 +11,7 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.RandomAccessInput;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.LongValues;
@@ -208,10 +209,34 @@ class ClustersTests {
     }
 
     @Test
+    void testOrdToCentroid_thenCreatesQueryPrivateRandomAccessLookup() throws IOException {
+        // given
+        int[] ordToCentroid = { 0, 1, 2, 1, 0, 2, 2, 1, 0, 2, 1, 0, 0, 1, 2, 2, 1, 0, 1 };
+        ClacFixture fixture = clacWithAssignments(ordToCentroid);
+        CountingInput input = new CountingInput(fixture.input(), new int[1]);
+        Clusters clusters = clusters(
+            VectorSimilarityFunction.EUCLIDEAN,
+            input,
+            fieldMeta(VectorSimilarityFunction.EUCLIDEAN, ordToCentroid.length, fixture.length(), fixture.offsets().clacCentroidsOffset())
+        );
+        input.resetRandomAccessSlices();
+
+        // when
+        LongValues first = clusters.ordToCentroid();
+        LongValues second = clusters.ordToCentroid();
+
+        // then
+        assertEquals(2, input.randomAccessSlices(), "each query must get its own random-access slice");
+        assertNotSame(first, second);
+    }
+
+    @Test
     void testOrdToCentroid_whenUsedConcurrently_thenReturnsPrimaryAssignments() throws Exception {
         // given
         int[] ordToCentroid = { 0, 1, 2, 1, 0, 2, 2, 1, 0, 2, 1, 0, 0, 1, 2, 2, 1, 0, 1 };
-        LongValues assignments = clustersWithAssignments(ordToCentroid).ordToCentroid();
+        Clusters clusters = clustersWithAssignments(ordToCentroid);
+        LongValues forwardAssignments = clusters.ordToCentroid();
+        LongValues backwardAssignments = clusters.ordToCentroid();
         CountDownLatch start = new CountDownLatch(1);
         ExecutorService executor = Executors.newFixedThreadPool(2);
 
@@ -219,14 +244,14 @@ class ClustersTests {
             Future<?> forward = executor.submit(() -> {
                 start.await();
                 for (int ordinal = 0; ordinal < ordToCentroid.length; ordinal++) {
-                    assertEquals(ordToCentroid[ordinal], assignments.get(ordinal), "forward ordinal " + ordinal);
+                    assertEquals(ordToCentroid[ordinal], forwardAssignments.get(ordinal), "forward ordinal " + ordinal);
                 }
                 return null;
             });
             Future<?> backward = executor.submit(() -> {
                 start.await();
                 for (int ordinal = ordToCentroid.length - 1; ordinal >= 0; ordinal--) {
-                    assertEquals(ordToCentroid[ordinal], assignments.get(ordinal), "backward ordinal " + ordinal);
+                    assertEquals(ordToCentroid[ordinal], backwardAssignments.get(ordinal), "backward ordinal " + ordinal);
                 }
                 return null;
             });
@@ -422,14 +447,28 @@ class ClustersTests {
     private static final class CountingInput extends org.apache.lucene.store.FilterIndexInput {
 
         private final int[] bytesRead;
+        private final int[] randomAccessSlices;
 
         private CountingInput(IndexInput in, int[] bytesRead) {
+            this(in, bytesRead, new int[1]);
+        }
+
+        private CountingInput(IndexInput in, int[] bytesRead, int[] randomAccessSlices) {
             super("counting(" + in + ")", in);
             this.bytesRead = bytesRead;
+            this.randomAccessSlices = randomAccessSlices;
         }
 
         private int bytesRead() {
             return bytesRead[0];
+        }
+
+        private int randomAccessSlices() {
+            return randomAccessSlices[0];
+        }
+
+        private void resetRandomAccessSlices() {
+            randomAccessSlices[0] = 0;
         }
 
         @Override
@@ -456,6 +495,42 @@ class ClustersTests {
             in.readFloats(floats, offset, length);
         }
 
+        @Override
+        public RandomAccessInput randomAccessSlice(long offset, long length) throws IOException {
+            randomAccessSlices[0]++;
+            RandomAccessInput slice = in.randomAccessSlice(offset, length);
+            return new RandomAccessInput() {
+                @Override
+                public long length() {
+                    return slice.length();
+                }
+
+                @Override
+                public byte readByte(long position) throws IOException {
+                    bytesRead[0]++;
+                    return slice.readByte(position);
+                }
+
+                @Override
+                public short readShort(long position) throws IOException {
+                    bytesRead[0] += Short.BYTES;
+                    return slice.readShort(position);
+                }
+
+                @Override
+                public int readInt(long position) throws IOException {
+                    bytesRead[0] += Integer.BYTES;
+                    return slice.readInt(position);
+                }
+
+                @Override
+                public long readLong(long position) throws IOException {
+                    bytesRead[0] += Long.BYTES;
+                    return slice.readLong(position);
+                }
+            };
+        }
+
         /**
          * Counted through, not around. The centroids are read from a slice of this input, and {@link
          * org.apache.lucene.store.FilterIndexInput#slice} hands back the underlying input — so without this override a
@@ -464,12 +539,12 @@ class ClustersTests {
          */
         @Override
         public IndexInput slice(String sliceDescription, long offset, long length) throws IOException {
-            return new CountingInput(in.slice(sliceDescription, offset, length), bytesRead);
+            return new CountingInput(in.slice(sliceDescription, offset, length), bytesRead, randomAccessSlices);
         }
 
         @Override
         public CountingInput clone() {
-            return new CountingInput(in.clone(), bytesRead);
+            return new CountingInput(in.clone(), bytesRead, randomAccessSlices);
         }
     }
 }
