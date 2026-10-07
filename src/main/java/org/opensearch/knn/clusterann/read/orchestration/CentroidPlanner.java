@@ -6,7 +6,11 @@
 package org.opensearch.knn.clusterann.read.orchestration;
 
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.index.KnnVectorValues;
+import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.BitSet;
+import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.VectorUtil;
@@ -34,28 +38,47 @@ public final class CentroidPlanner {
 
     /**
      * Rank this field's centroids against the query and name the clusters to visit, considering only clusters reached
-     * by the ord-space filter when one is present.
+     * by the document-space filter when one is present.
      *
      * <p>A null or accept-all filter takes the unfiltered path without reading ordinal-to-centroid assignments.
      *
      * @param clusters the field's clusters
      * @param query the query vector, in the space it arrived in; not modified
      * @param params the bounds to choose within
-     * @param acceptedOrds ord-space filter membership, or null for an unfiltered search
+     * @param acceptDocs document-space filter, or null for an unfiltered search
      * @return centroid ordinals to probe, ordered closest-first; empty if no non-empty cluster matches
      */
-    public static int[] plan(Clusters clusters, float[] query, PlanParams params, FixedBitSet acceptedOrds) throws IOException {
-        if (acceptedOrds == null
-            || clusters.numClusters() == 0
-            || (acceptedOrds.length() == clusters.numVectors() && acceptedOrds.cardinality() == clusters.numVectors())) {
+    public static int[] plan(Clusters clusters, float[] query, PlanParams params, AcceptDocs acceptDocs) throws IOException {
+        if (acceptDocs == null || clusters.numClusters() == 0) {
+            return plan(clusters, query, params);
+        }
+
+        final Bits acceptedBits = acceptDocs.bits();
+        if (acceptedBits == null || (acceptedBits instanceof BitSet && acceptDocs.cost() == acceptedBits.length())) {
             return plan(clusters, query, params);
         }
 
         final LongValues ordToCentroid = clusters.ordToCentroid();
         final FixedBitSet acceptedCentroids = new FixedBitSet(clusters.numClusters());
-        for (int ord = acceptedOrds.nextSetBit(0); ord != DocIdSetIterator.NO_MORE_DOCS && ord < clusters.numVectors(); ord = ord
-            + 1 < acceptedOrds.length() ? acceptedOrds.nextSetBit(ord + 1) : DocIdSetIterator.NO_MORE_DOCS) {
-            acceptedCentroids.set((int) ordToCentroid.get(ord));
+        final DocIdSetIterator acceptedDocs = acceptDocs.iterator();
+        if (clusters.hasDenseVectorValues()) {
+            for (int doc = acceptedDocs.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = acceptedDocs.nextDoc()) {
+                acceptedCentroids.set((int) ordToCentroid.get(doc));
+            }
+        } else {
+            final KnnVectorValues.DocIndexIterator vectorDocs = clusters.sparseVectorDocs();
+            for (int doc = acceptedDocs.nextDoc(), vectorDoc = vectorDocs.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS
+                && vectorDoc != DocIdSetIterator.NO_MORE_DOCS;) {
+                if (vectorDoc < doc) {
+                    vectorDoc = vectorDocs.advance(doc);
+                } else if (doc < vectorDoc) {
+                    doc = acceptedDocs.advance(vectorDoc);
+                } else {
+                    acceptedCentroids.set((int) ordToCentroid.get(vectorDocs.index()));
+                    doc = acceptedDocs.nextDoc();
+                    vectorDoc = vectorDocs.nextDoc();
+                }
+            }
         }
         return planEligible(clusters, query, params, acceptedCentroids);
     }

@@ -23,7 +23,6 @@ import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.hnsw.OrdinalTranslatedKnnCollector;
@@ -250,9 +249,9 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
             knnCollector,
             (ord) -> Math.toIntExact(ordToDoc.get(ord))
         );
-        final FixedBitSet acceptedOrds = buildAcceptedOrds(acceptDocs, ordToDoc, fieldClusters.numVectors());
+        final Bits acceptedOrds = buildAcceptedOrds(acceptDocs, ordToDoc, fieldClusters.numVectors());
 
-        final int[] probes = CentroidPlanner.plan(fieldClusters, query, PlanParams.of(fieldClusters.numClusters()), acceptedOrds);
+        final int[] probes = CentroidPlanner.plan(fieldClusters, query, PlanParams.of(fieldClusters.numClusters()), acceptDocs);
 
         float[] scanQuery = new float[query.length];
         fieldClusters.rotation().rotate(query, scanQuery);
@@ -260,19 +259,23 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
         ClusterSearcher.search(fieldClusters, probes, ScanParams.of(scanQuery), translatedKnnCollector, acceptedOrds);
     }
 
-    private FixedBitSet buildAcceptedOrds(AcceptDocs acceptDocs, LongValues ordToDoc, int numVectors) throws IOException {
+    private Bits buildAcceptedOrds(AcceptDocs acceptDocs, LongValues ordToDoc, int numVectors) throws IOException {
         if (acceptDocs == null) return null;
 
         Bits docBits = acceptDocs.bits();
         if (docBits == null) return null; // match-all
 
-        final FixedBitSet acceptedOrds = new FixedBitSet(numVectors);
-        for (int ord = 0; ord < numVectors; ord++) {
-            if (docBits.get((int) ordToDoc.get(ord))) {
-                acceptedOrds.set(ord);
+        return new Bits() {
+            @Override
+            public boolean get(int ord) {
+                return docBits.get((int) ordToDoc.get(ord));
             }
-        }
-        return acceptedOrds.cardinality() == numVectors ? null : acceptedOrds;
+
+            @Override
+            public int length() {
+                return numVectors;
+            }
+        };
     }
 
     private Clusters clusters(String fieldName) {
