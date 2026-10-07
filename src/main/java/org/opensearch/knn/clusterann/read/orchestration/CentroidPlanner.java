@@ -8,13 +8,13 @@ package org.opensearch.knn.clusterann.read.orchestration;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.hnsw.NeighborQueue;
 import org.opensearch.knn.clusterann.read.CentroidVectorValues;
 import org.opensearch.knn.clusterann.read.Clusters;
 
 import java.io.IOException;
-import java.util.function.IntUnaryOperator;
 
 /**
  * Chooses which clusters a query should visit.
@@ -51,11 +51,11 @@ public final class CentroidPlanner {
             return plan(clusters, query, params);
         }
 
-        final IntUnaryOperator ordToCentroid = clusters.ordToCentroid();
+        final LongValues ordToCentroid = clusters.ordToCentroid();
         final FixedBitSet acceptedCentroids = new FixedBitSet(clusters.numClusters());
         for (int ord = acceptedOrds.nextSetBit(0); ord != DocIdSetIterator.NO_MORE_DOCS && ord < clusters.numVectors(); ord = ord
             + 1 < acceptedOrds.length() ? acceptedOrds.nextSetBit(ord + 1) : DocIdSetIterator.NO_MORE_DOCS) {
-            acceptedCentroids.set(ordToCentroid.applyAsInt(ord));
+            acceptedCentroids.set((int) ordToCentroid.get(ord));
         }
         return planEligible(clusters, query, params, acceptedCentroids);
     }

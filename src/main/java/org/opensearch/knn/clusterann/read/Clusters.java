@@ -7,6 +7,7 @@ package org.opensearch.knn.clusterann.read;
 
 import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.RandomAccessInput;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
 import org.apache.lucene.util.LongValues;
 import org.opensearch.knn.clusterann.read.orchestration.ClusterScan;
@@ -16,7 +17,7 @@ import org.opensearch.knn.clusterann.format.rotation.RotationFormats;
 
 import org.opensearch.common.Nullable;
 import java.io.IOException;
-import java.util.function.IntUnaryOperator;
+import java.io.UncheckedIOException;
 
 import static org.opensearch.knn.clusterann.read.CentroidVectorValues.floatsPerCentroid;
 
@@ -33,7 +34,7 @@ public final class Clusters {
     private final ClusterANNFieldMeta fieldMeta;
     private final ClusterFactory clusterFactory;
     private final LongValues ordToDoc;
-    private final IndexInput ordToCentroidBase;
+    private final LongValues ordToCentroid;
     private final CentroidVectorValues centroidsBase;
     private final Rotation rotation;
 
@@ -55,7 +56,17 @@ public final class Clusters {
         this.rotation = RotationFormats.read(fieldMeta.rotationId(), rotation, fieldMeta.dimension());
 
         long ordToCentroidBytes = Math.multiplyExact((long) fieldMeta.vectorCount(), Integer.BYTES);
-        this.ordToCentroidBase = centroids.slice("ord-to-centroid", 0L, ordToCentroidBytes);
+        final RandomAccessInput assignments = centroids.randomAccessSlice(0L, ordToCentroidBytes);
+        this.ordToCentroid = new LongValues() {
+            @Override
+            public long get(long ordinal) {
+                try {
+                    return assignments.readInt(ordinal * Integer.BYTES);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            }
+        };
 
         long centroidsBytes = (long) fieldMeta.centroidCount() * floatsPerCentroid(fieldMeta.dimension()) * Float.BYTES;
         this.centroidsBase = new CentroidVectorValues(
@@ -98,15 +109,11 @@ public final class Clusters {
     }
 
     /**
-     * Read-only primary centroid assignment for each vector ordinal, loaded from region 1 of this field's
-     * {@code .clac} data.
+     * Read-only primary centroid assignment for each vector ordinal, read lazily from region 1 of this field's
+     * {@code .clac} data through positional access.
      */
-    public IntUnaryOperator ordToCentroid() throws IOException {
-        final int[] ordToCentroid = new int[fieldMeta.vectorCount()];
-        final IndexInput assignments = ordToCentroidBase.clone();
-        assignments.seek(0L);
-        assignments.readInts(ordToCentroid, 0, ordToCentroid.length);
-        return ordinal -> ordToCentroid[ordinal];
+    public LongValues ordToCentroid() {
+        return ordToCentroid;
     }
 
     /** Number of vectors in this field, across all clusters. */

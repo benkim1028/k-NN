@@ -13,6 +13,7 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.LongValues;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -31,7 +32,10 @@ import org.opensearch.knn.clusterann.write.CentroidsWriter.CentroidOffsets;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.IntUnaryOperator;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
@@ -137,7 +141,7 @@ class ClustersTests {
         }
 
         // then
-        assertEquals(0, centroidsInput.reads(), "a cluster that is never scanned must not read its centroid");
+        assertEquals(0, centroidsInput.bytesRead(), "a cluster that is never scanned must not read its centroid");
     }
 
     @Test
@@ -173,11 +177,68 @@ class ClustersTests {
         int[] ordToCentroid = { 0, 1, 2, 1, 0, 2, 2, 1, 0, 2, 1, 0, 0, 1, 2, 2, 1, 0, 1 };
 
         // when
-        IntUnaryOperator assignments = clustersWithAssignments(ordToCentroid).ordToCentroid();
+        LongValues assignments = clustersWithAssignments(ordToCentroid).ordToCentroid();
 
         // then
         for (int ordinal = 0; ordinal < ordToCentroid.length; ordinal++) {
-            assertEquals(ordToCentroid[ordinal], assignments.applyAsInt(ordinal), "ordinal " + ordinal);
+            assertEquals(ordToCentroid[ordinal], assignments.get(ordinal), "ordinal " + ordinal);
+        }
+    }
+
+    @Test
+    void testOrdToCentroid_thenDoesNotReadAssignmentsUntilLookup() throws IOException {
+        // given
+        int[] ordToCentroid = { 0, 1, 2, 1, 0, 2, 2, 1, 0, 2, 1, 0, 0, 1, 2, 2, 1, 0, 1 };
+        ClacFixture fixture = clacWithAssignments(ordToCentroid);
+        CountingInput input = new CountingInput(fixture.input(), new int[1]);
+        Clusters clusters = clusters(
+            VectorSimilarityFunction.EUCLIDEAN,
+            input,
+            fieldMeta(VectorSimilarityFunction.EUCLIDEAN, ordToCentroid.length, fixture.length(), fixture.offsets().clacCentroidsOffset())
+        );
+        assertEquals(0, input.bytesRead(), "constructing Clusters must not read region 1");
+
+        // when
+        LongValues assignments = clusters.ordToCentroid();
+
+        // then
+        assertEquals(0, input.bytesRead(), "building the accessor must not read region 1");
+        assertEquals(ordToCentroid[7], assignments.get(7));
+        assertEquals(Integer.BYTES, input.bytesRead(), "one lookup must read only its own assignment");
+    }
+
+    @Test
+    void testOrdToCentroid_whenUsedConcurrently_thenReturnsPrimaryAssignments() throws Exception {
+        // given
+        int[] ordToCentroid = { 0, 1, 2, 1, 0, 2, 2, 1, 0, 2, 1, 0, 0, 1, 2, 2, 1, 0, 1 };
+        LongValues assignments = clustersWithAssignments(ordToCentroid).ordToCentroid();
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+
+        try {
+            Future<?> forward = executor.submit(() -> {
+                start.await();
+                for (int ordinal = 0; ordinal < ordToCentroid.length; ordinal++) {
+                    assertEquals(ordToCentroid[ordinal], assignments.get(ordinal), "forward ordinal " + ordinal);
+                }
+                return null;
+            });
+            Future<?> backward = executor.submit(() -> {
+                start.await();
+                for (int ordinal = ordToCentroid.length - 1; ordinal >= 0; ordinal--) {
+                    assertEquals(ordToCentroid[ordinal], assignments.get(ordinal), "backward ordinal " + ordinal);
+                }
+                return null;
+            });
+
+            // when
+            start.countDown();
+
+            // then
+            forward.get();
+            backward.get();
+        } finally {
+            executor.shutdownNow();
         }
     }
 
@@ -357,52 +418,58 @@ class ClustersTests {
     private record ClacFixture(IndexInput input, long length, CentroidOffsets offsets) {
     }
 
-    /** Counts reads, so "get() reads nothing" is asserted rather than assumed. Clones share the counter. */
+    /** Counts bytes read, so lazy access is asserted rather than assumed. Clones and slices share the counter. */
     private static final class CountingInput extends org.apache.lucene.store.FilterIndexInput {
 
-        private final int[] reads;
+        private final int[] bytesRead;
 
-        private CountingInput(IndexInput in, int[] reads) {
+        private CountingInput(IndexInput in, int[] bytesRead) {
             super("counting(" + in + ")", in);
-            this.reads = reads;
+            this.bytesRead = bytesRead;
         }
 
-        private int reads() {
-            return reads[0];
+        private int bytesRead() {
+            return bytesRead[0];
         }
 
         @Override
         public byte readByte() throws IOException {
-            reads[0]++;
+            bytesRead[0]++;
             return in.readByte();
         }
 
         @Override
         public void readBytes(byte[] bytes, int offset, int length) throws IOException {
-            reads[0]++;
+            bytesRead[0] += length;
             in.readBytes(bytes, offset, length);
         }
 
         @Override
+        public int readInt() throws IOException {
+            bytesRead[0] += Integer.BYTES;
+            return in.readInt();
+        }
+
+        @Override
         public void readFloats(float[] floats, int offset, int length) throws IOException {
-            reads[0]++;
+            bytesRead[0] += length * Float.BYTES;
             in.readFloats(floats, offset, length);
         }
 
         /**
          * Counted through, not around. The centroids are read from a slice of this input, and {@link
          * org.apache.lucene.store.FilterIndexInput#slice} hands back the underlying input — so without this override a
-         * read through the slice would go uncounted, and a {@code reads() == 0} assertion would hold whether or not
+         * read through the slice would go uncounted, and a {@code bytesRead() == 0} assertion would hold whether or not
          * anything was read.
          */
         @Override
         public IndexInput slice(String sliceDescription, long offset, long length) throws IOException {
-            return new CountingInput(in.slice(sliceDescription, offset, length), reads);
+            return new CountingInput(in.slice(sliceDescription, offset, length), bytesRead);
         }
 
         @Override
         public CountingInput clone() {
-            return new CountingInput(in.clone(), reads);
+            return new CountingInput(in.clone(), bytesRead);
         }
     }
 }
