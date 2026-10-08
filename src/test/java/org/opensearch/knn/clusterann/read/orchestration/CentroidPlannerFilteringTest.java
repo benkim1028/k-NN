@@ -25,6 +25,7 @@ import org.opensearch.knn.clusterann.read.Clusters;
 import org.opensearch.knn.clusterann.write.CentroidsWriter;
 import org.opensearch.knn.clusterann.write.CentroidsWriter.CentroidData;
 import org.opensearch.knn.clusterann.write.CentroidsWriter.CentroidOffsets;
+import org.opensearch.knn.plugin.stats.ClusterANNQueryValue;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -88,6 +89,7 @@ class CentroidPlannerFilteringTest {
     @Test
     void testPlanWithFilter_whenAcceptAll_thenMatchesUnfilteredPath() throws IOException {
         // given
+        resetStats();
         float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 3f, 0f } };
         Clusters clusters = spy(clusters(centroids));
         FixedBitSet acceptedOrds = new FixedBitSet(Arrays.stream(CLUSTER_SIZES).sum());
@@ -102,6 +104,8 @@ class CentroidPlannerFilteringTest {
         // then
         assertArrayEquals(expected, actual);
         verify(clusters, never()).ordToCentroid();
+        assertEquals(0L, ClusterANNQueryValue.FILTERED_SEGMENT_SCANS.getValue());
+        assertEquals(0L, ClusterANNQueryValue.ELIGIBLE_CLUSTERS.getValue());
     }
 
     @Test
@@ -178,6 +182,30 @@ class CentroidPlannerFilteringTest {
         // then
         assertArrayEquals(unfiltered, filtered);
         assertEquals(params.maxProbes(), filtered.length);
+    }
+
+    @Test
+    void testPlanFiltered_whenEligibleClustersExceedBudget_thenCountsEveryEligibleCluster() throws IOException {
+        // given
+        resetStats();
+        float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 3f, 0f }, { 4f, 0f } };
+        int[] clusterSizes = { 1, 1, 1, 1 };
+        FixedBitSet acceptedOrds = new FixedBitSet(clusterSizes.length);
+        acceptedOrds.set(0, 3);
+        PlanParams params = new PlanParams(1, 2);
+
+        // when
+        int[] probes = CentroidPlanner.plan(
+            clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, clusterSizes),
+            new float[] { 0f, 0f },
+            params,
+            acceptDocs(acceptedOrds)
+        );
+
+        // then
+        assertArrayEquals(new int[] { 0, 1 }, probes);
+        assertEquals(1L, ClusterANNQueryValue.FILTERED_SEGMENT_SCANS.getValue());
+        assertEquals(3L, ClusterANNQueryValue.ELIGIBLE_CLUSTERS.getValue());
     }
 
     @Test
@@ -279,6 +307,12 @@ class CentroidPlannerFilteringTest {
 
     private static AcceptDocs acceptDocs(FixedBitSet acceptedDocs) {
         return AcceptDocs.fromLiveDocs(acceptedDocs, acceptedDocs.length());
+    }
+
+    private static void resetStats() {
+        for (ClusterANNQueryValue value : ClusterANNQueryValue.values()) {
+            value.set(0);
+        }
     }
 
     private Clusters clusters(float[][] centroids) throws IOException {

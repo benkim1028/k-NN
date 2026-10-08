@@ -29,6 +29,12 @@ public enum ClusterANNQueryValue {
     /** Clusters actually walked. Short of {@link #CLUSTERS_PROBED} by the probes that landed on empty clusters. */
     CLUSTERS_SCANNED("clusters_scanned"),
 
+    /** Segment scans that took the restrictive filtered-planning path. */
+    FILTERED_SEGMENT_SCANS("filtered_segment_scans"),
+
+    /** Non-empty clusters holding at least one accepted primary vector, before the probe cap. */
+    ELIGIBLE_CLUSTERS("eligible_clusters"),
+
     /**
      * Distances computed. Not the hits returned: a posting is scored and may still lose to the threshold, so this
      * is the CPU the scan spent, where the collector's visited count is what survived.

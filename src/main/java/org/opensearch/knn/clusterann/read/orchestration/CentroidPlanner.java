@@ -17,6 +17,7 @@ import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.hnsw.NeighborQueue;
 import org.opensearch.knn.clusterann.read.CentroidVectorValues;
 import org.opensearch.knn.clusterann.read.Clusters;
+import org.opensearch.knn.plugin.stats.ClusterANNQueryValue;
 
 import java.io.IOException;
 
@@ -121,6 +122,7 @@ public final class CentroidPlanner {
         throws IOException {
         int numClusters = clusters.numClusters();
         if (numClusters == 0 || acceptedCentroids.cardinality() == 0) {
+            ClusterANNQueryValue.FILTERED_SEGMENT_SCANS.increment();
             return NO_PROBES;
         }
 
@@ -129,13 +131,17 @@ public final class CentroidPlanner {
         float queryNormSq = similarity == VectorSimilarityFunction.EUCLIDEAN ? VectorUtil.dotProduct(query, query) : 0f;
 
         final NeighborQueue nearest = new NeighborQueue(params.maxProbes(), true);
+        int eligibleClusters = 0;
         for (int ordinal = acceptedCentroids.nextSetBit(0); ordinal != DocIdSetIterator.NO_MORE_DOCS && ordinal < numClusters; ordinal =
             ordinal + 1 < acceptedCentroids.length() ? acceptedCentroids.nextSetBit(ordinal + 1) : DocIdSetIterator.NO_MORE_DOCS) {
             if (clusters.clusterSize(ordinal) != 0) {
+                eligibleClusters++;
                 final float[] centroid = centroids.vectorValue(ordinal);
                 nearest.insertWithOverflow(ordinal, distanceKey(similarity, query, queryNormSq, centroid, centroids));
             }
         }
+        ClusterANNQueryValue.FILTERED_SEGMENT_SCANS.increment();
+        ClusterANNQueryValue.ELIGIBLE_CLUSTERS.incrementBy(eligibleClusters);
         return closestFirst(nearest);
     }
 
