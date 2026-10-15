@@ -19,6 +19,7 @@ import org.opensearch.knn.clusterann.read.CentroidVectorValues;
 import org.opensearch.knn.clusterann.read.Clusters;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -29,6 +30,9 @@ import java.util.List;
  * instead. The scan relies on that order and does not restore it.
  *
  * <p>Ranks on a distance-like key (smaller is closer)
+ *
+ * <p>The ceiling bounds what a query may spend; {@link CentroidKneePruner} cuts what it should not. Unfiltered
+ * plans only.
  *
  * <p>Stateless and thread-safe: the only cursor it uses is a private copy taken per call.
  */
@@ -91,8 +95,12 @@ public final class CentroidPlanner {
                 acceptedVectors++;
             }
         }
-        final int maxProbes = acceptedVectors <= k ? acceptedCentroids.cardinality() : params.maxProbes();
-        return planEligible(clusters, query, maxProbes, acceptedCentroids);
+        final int eligibleClusters = acceptedCentroids.cardinality();
+        if (eligibleClusters == 0) {
+            return NO_PROBES;
+        }
+        final int maxProbes = acceptedVectors <= k ? eligibleClusters : params.maxProbes();
+        return probes(clusters, query, maxProbes, params.minProbes(), acceptedCentroids);
     }
 
     /**
@@ -105,49 +113,47 @@ public final class CentroidPlanner {
      * @param query the query vector, in the space it arrived in; not modified
      * @param params the bounds to choose within
      * @return centroid ordinals to probe, ordered closest-first; empty if the field has no non-empty cluster
-     *
-     * TODO: return NeighborQueue directly if possible, waiting it out for inter-cluster pruning strategies to be added
      */
     static int[] plan(Clusters clusters, float[] query, PlanParams params) throws IOException {
-        int numClusters = clusters.numClusters();
-        if (numClusters == 0) {
+        if (clusters.numClusters() == 0) {
             return NO_PROBES;
         }
-
-        final VectorSimilarityFunction similarity = clusters.clusterMeta().similarityFunction();
-        final CentroidVectorValues centroids = clusters.centroids();
-        float queryNormSq = similarity == VectorSimilarityFunction.EUCLIDEAN ? VectorUtil.dotProduct(query, query) : 0f;
-
-        final NeighborQueue nearest = new NeighborQueue(params.maxProbes(), true);
-        for (int ordinal = 0; ordinal < numClusters; ordinal++) {
-            if (clusters.clusterSize(ordinal) != 0) {
-                final float[] centroid = centroids.vectorValue(ordinal);
-                nearest.insertWithOverflow(ordinal, distanceKey(similarity, query, queryNormSq, centroid, centroids));
-            }
-        }
-        return closestFirst(nearest);
+        return probes(clusters, query, params.maxProbes(), params.minProbes(), null);
     }
 
-    /** Rank only the centroids the filter reaches, using the same plain distance key as unfiltered planning. */
-    private static int[] planEligible(Clusters clusters, float[] query, int maxProbes, FixedBitSet acceptedCentroids) throws IOException {
-        int numClusters = clusters.numClusters();
-        if (numClusters == 0 || acceptedCentroids.cardinality() == 0) {
-            return NO_PROBES;
-        }
-
+    /**
+     * Rank the candidate centroids and name the clusters to visit, closest first.
+     *
+     * @param eligibleCentroids ordinals to consider, or null when nothing is filtered out
+     * @param minProbes floor the knee may not cut below
+     */
+    private static int[] probes(Clusters clusters, float[] query, int maxProbes, int minProbes, FixedBitSet eligibleCentroids)
+        throws IOException {
+        final int numClusters = clusters.numClusters();
         final VectorSimilarityFunction similarity = clusters.clusterMeta().similarityFunction();
         final CentroidVectorValues centroids = clusters.centroids();
-        float queryNormSq = similarity == VectorSimilarityFunction.EUCLIDEAN ? VectorUtil.dotProduct(query, query) : 0f;
+        final float queryNormSq = similarity == VectorSimilarityFunction.EUCLIDEAN ? VectorUtil.dotProduct(query, query) : 0f;
 
         final NeighborQueue nearest = new NeighborQueue(maxProbes, true);
-        for (int ordinal = acceptedCentroids.nextSetBit(0); ordinal != DocIdSetIterator.NO_MORE_DOCS && ordinal < numClusters; ordinal =
-            ordinal + 1 < acceptedCentroids.length() ? acceptedCentroids.nextSetBit(ordinal + 1) : DocIdSetIterator.NO_MORE_DOCS) {
+        for (int ordinal = nextCandidate(eligibleCentroids, 0); ordinal < numClusters; ordinal = nextCandidate(
+            eligibleCentroids,
+            ordinal + 1
+        )) {
             if (clusters.clusterSize(ordinal) != 0) {
                 final float[] centroid = centroids.vectorValue(ordinal);
-                nearest.insertWithOverflow(ordinal, distanceKey(similarity, query, queryNormSq, centroid, centroids));
+                nearest.insertWithOverflow(ordinal, distanceKey(similarity, query, queryNormSq, centroid, centroids.norm()));
             }
         }
-        return closestFirst(nearest);
+
+        return closestFirstPruned(nearest, minProbes, eligibleCentroids);
+    }
+
+    /** The first candidate ordinal at or after {@code from}: {@code from} itself when nothing is filtered out. */
+    private static int nextCandidate(final FixedBitSet eligible, final int from) {
+        if (eligible == null) {
+            return from;
+        }
+        return from < eligible.length() ? eligible.nextSetBit(from) : DocIdSetIterator.NO_MORE_DOCS;
     }
 
     /**
@@ -164,23 +170,37 @@ public final class CentroidPlanner {
         float[] query,
         float queryNormSq,
         float[] centroid,
-        CentroidVectorValues centroids
+        float centroidNorm
     ) {
         float dot = VectorUtil.dotProduct(query, centroid);
         return switch (similarity) {
-            case EUCLIDEAN -> queryNormSq - 2 * dot + centroids.norm();
+            case EUCLIDEAN -> queryNormSq - 2 * dot + centroidNorm;
             case MAXIMUM_INNER_PRODUCT -> -dot;
             case DOT_PRODUCT -> throw new IllegalStateException("ClusterANN does not support DOT_PRODUCT; use MAXIMUM_INNER_PRODUCT");
-            case COSINE -> -dot / (float) Math.sqrt(centroids.norm());
+            case COSINE -> -dot / (float) Math.sqrt(centroidNorm);
         };
     }
 
-    /** Drain the heap into ordinals, closest-first. {@code pop} yields farthest first, so fill from the back. */
-    private static int[] closestFirst(final NeighborQueue nearest) {
-        int[] probes = new int[nearest.size()];
-        for (int i = probes.length - 1; i >= 0; i--) {
+    /**
+     * Drain the heap into ordinals, closest-first, cutting at the knee when unfiltered. {@code pop} yields farthest
+     * first, so both arrays fill from the back; the keys ride along because the heap is the only place the curve is.
+     */
+    private static int[] closestFirstPruned(final NeighborQueue nearest, final int minProbes, FixedBitSet eligibleCentroids) {
+        final int ranked = nearest.size();
+        final int[] probes = new int[ranked];
+        final float[] distances = new float[ranked];
+        for (int i = ranked - 1; i >= 0; i--) {
+            distances[i] = nearest.topScore();
             probes[i] = nearest.pop();
         }
-        return probes;
+
+        // TODO: eligibleCentroids is non-null on a filtered query. Rather than skip pruning outright, decide from
+        // filter selectivity: above ~0.7-0.8 the curve is still mostly the query's own geometry and can take the cut.
+        if (eligibleCentroids != null) {
+            return probes;
+        }
+
+        final int keep = CentroidKneePruner.prune(distances, minProbes);
+        return keep == ranked ? probes : Arrays.copyOf(probes, keep);
     }
 }

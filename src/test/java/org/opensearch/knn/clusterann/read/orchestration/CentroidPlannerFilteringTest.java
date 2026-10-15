@@ -262,6 +262,32 @@ class CentroidPlannerFilteringTest {
         assertArrayEquals(IntStream.range(0, centroids.length - 1).toArray(), filtered);
     }
 
+    /** Filtered plans are not knee-pruned, so a cluster past the knee survives. The curve above has no knee. */
+    @Test
+    void testPlanFiltered_whenTheCurveHasAKnee_thenStillPlansEveryEligibleCentroid() throws IOException {
+        float[][] centroids = new float[129][DIMENSION];
+        int[] clusterSizes = new int[centroids.length];
+        for (int ordinal = 0; ordinal < centroids.length; ordinal++) {
+            centroids[ordinal][0] = ordinal + 1;
+            clusterSizes[ordinal] = 1;
+        }
+        // The last eligible centroid sits far beyond the rest, so the gap into it dwarfs the mean gap and is a knee.
+        centroids[centroids.length - 2][0] = 10_000f;
+        FixedBitSet acceptedOrds = new FixedBitSet(centroids.length);
+        acceptedOrds.set(0, centroids.length - 1);
+
+        int[] filtered = CentroidPlanner.plan(
+            clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, clusterSizes),
+            new float[DIMENSION],
+            PlanParams.of(centroids.length),
+            centroids.length - 1,
+            acceptDocs(acceptedOrds),
+            DENSE_FIELD
+        );
+
+        assertArrayEquals(IntStream.range(0, centroids.length - 1).toArray(), filtered);
+    }
+
     @Test
     void testPlanFiltered_whenKIsOneBelowTheAcceptedVectors_thenUsesExactlyMaxProbes() throws IOException {
         float[][] centroids = new float[129][DIMENSION];
