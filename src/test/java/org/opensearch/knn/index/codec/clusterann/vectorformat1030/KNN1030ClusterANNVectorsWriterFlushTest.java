@@ -267,11 +267,12 @@ public class KNN1030ClusterANNVectorsWriterFlushTest extends LuceneTestCase {
         }
     }
 
-    public void testSearch_whenCappedFilteredClustersHoldFewerThanK_returnsFewerThanK() throws Exception {
+    public void testSearch_whenKCoversEveryAcceptedVector_returnsEveryAcceptedVector() throws Exception {
         final int groupSize = 512;
         final int groups = 16;
         final int numDocs = groupSize * groups;
-        final int k = numDocs - 1;
+        final int acceptedDocs = numDocs - 1;
+        final int k = acceptedDocs;
 
         try (Directory dir = new ByteBuffersDirectory()) {
             final IndexWriterConfig iwc = new IndexWriterConfig().setCodec(new ClusterANN1030TestCodec(4))
@@ -295,7 +296,7 @@ public class KNN1030ClusterANNVectorsWriterFlushTest extends LuceneTestCase {
                     .reader()
                     .searchNearestVectors(L2_FIELD, new float[DIMENSION], k, AcceptDocs.fromLiveDocs(accepted, numDocs), Integer.MAX_VALUE);
 
-                assertTrue("strict probe parity may return fewer than k results", hits.scoreDocs.length < k);
+                assertEquals("every accepted document must be returned", acceptedDocs, hits.scoreDocs.length);
                 for (var hit : hits.scoreDocs) {
                     assertTrue("the excluded document must not be returned", accepted.get(hit.doc));
                 }

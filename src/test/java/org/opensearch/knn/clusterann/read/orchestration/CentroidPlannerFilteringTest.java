@@ -34,6 +34,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -48,6 +49,8 @@ class CentroidPlannerFilteringTest {
     private static final int DIMENSION = 2;
     private static final int DIRECT_MONOTONIC_BLOCK_SHIFT = 16;
     private static final int[] CLUSTER_SIZES = { 4, 4, 4 };
+    /** Too small to cover the accepted vectors wherever the probe cap matters, so those tests still see the cap. */
+    private static final int K = 1;
     private static final IOSupplier<KnnVectorValues.DocIndexIterator> DENSE_FIELD = () -> {
         throw new AssertionError("a dense field maps documents to ordinals directly and must not read its vector docs");
     };
@@ -68,7 +71,7 @@ class CentroidPlannerFilteringTest {
         PlanParams params = new PlanParams(1, centroids.length);
         float[] query = { 0f, 0f };
 
-        int[] actual = CentroidPlanner.plan(clusters, query, params, null, DENSE_FIELD);
+        int[] actual = CentroidPlanner.plan(clusters, query, params, K, null, DENSE_FIELD);
         int[] expected = CentroidPlanner.plan(clusters, query, params);
 
         assertArrayEquals(expected, actual);
@@ -83,7 +86,7 @@ class CentroidPlannerFilteringTest {
         PlanParams params = new PlanParams(1, centroids.length);
         float[] query = { 0f, 0f };
 
-        int[] actual = CentroidPlanner.plan(clusters, query, params, acceptDocs(acceptedOrds), DENSE_FIELD);
+        int[] actual = CentroidPlanner.plan(clusters, query, params, K, acceptDocs(acceptedOrds), DENSE_FIELD);
 
         assertArrayEquals(new int[] { 0, 1 }, actual);
     }
@@ -97,7 +100,7 @@ class CentroidPlannerFilteringTest {
         PlanParams params = new PlanParams(1, centroids.length);
         float[] query = { 0f, 0f };
 
-        int[] actual = CentroidPlanner.plan(clusters, query, params, acceptDocs(acceptedOrds), DENSE_FIELD);
+        int[] actual = CentroidPlanner.plan(clusters, query, params, K, acceptDocs(acceptedOrds), DENSE_FIELD);
         int[] expected = CentroidPlanner.plan(clusters, query, params);
 
         assertArrayEquals(expected, actual);
@@ -116,6 +119,7 @@ class CentroidPlannerFilteringTest {
             clusters,
             query,
             params,
+            K,
             AcceptDocs.fromLiveDocs(null, Arrays.stream(CLUSTER_SIZES).sum()),
             DENSE_FIELD
         );
@@ -135,6 +139,7 @@ class CentroidPlannerFilteringTest {
             clusters,
             new float[] { 0f, 0f },
             new PlanParams(1, centroids.length),
+            K,
             acceptDocs(acceptedOrds(0)),
             DENSE_FIELD
         );
@@ -152,7 +157,7 @@ class CentroidPlannerFilteringTest {
         PlanParams params = new PlanParams(1, centroids.length);
         float[] query = { 0f, 0f };
 
-        int[] actual = CentroidPlanner.plan(clusters, query, params, acceptDocs(acceptedOrds), DENSE_FIELD);
+        int[] actual = CentroidPlanner.plan(clusters, query, params, K, acceptDocs(acceptedOrds), DENSE_FIELD);
 
         assertArrayEquals(new int[0], actual);
     }
@@ -166,6 +171,7 @@ class CentroidPlannerFilteringTest {
             clusters(VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT, centroids),
             new float[] { 1f, 0f },
             new PlanParams(1, centroids.length),
+            K,
             acceptDocs(acceptedOrds),
             DENSE_FIELD
         );
@@ -182,7 +188,7 @@ class CentroidPlannerFilteringTest {
         PlanParams params = new PlanParams(1, centroids.length);
         float[] query = { 1f, 0f };
 
-        int[] filtered = CentroidPlanner.plan(clusters, query, params, acceptDocs(acceptedOrds), DENSE_FIELD);
+        int[] filtered = CentroidPlanner.plan(clusters, query, params, K, acceptDocs(acceptedOrds), DENSE_FIELD);
         int[] unfiltered = CentroidPlanner.plan(clusters, query, params);
 
         assertArrayEquals(unfiltered, filtered);
@@ -202,7 +208,7 @@ class CentroidPlannerFilteringTest {
         acceptedOrds.set(0, acceptedOrds.length());
         PlanParams params = PlanParams.of(centroids.length);
 
-        int[] filtered = CentroidPlanner.plan(clusters, new float[DIMENSION], params, acceptDocs(acceptedOrds), DENSE_FIELD);
+        int[] filtered = CentroidPlanner.plan(clusters, new float[DIMENSION], params, K, acceptDocs(acceptedOrds), DENSE_FIELD);
         int[] unfiltered = CentroidPlanner.plan(clusters, new float[DIMENSION], params);
 
         assertArrayEquals(unfiltered, filtered);
@@ -225,11 +231,110 @@ class CentroidPlannerFilteringTest {
             clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, clusterSizes),
             new float[DIMENSION],
             params,
+            K,
             acceptDocs(acceptedOrds),
             DENSE_FIELD
         );
 
         assertEquals(params.maxProbes(), filtered.length);
+    }
+
+    @Test
+    void testPlanFiltered_whenKCoversEveryAcceptedVector_thenPlansEveryEligibleCentroidClosestFirst() throws IOException {
+        float[][] centroids = new float[129][DIMENSION];
+        int[] clusterSizes = new int[centroids.length];
+        for (int ordinal = 0; ordinal < centroids.length; ordinal++) {
+            centroids[ordinal][0] = ordinal + 1;
+            clusterSizes[ordinal] = 1;
+        }
+        FixedBitSet acceptedOrds = new FixedBitSet(centroids.length);
+        acceptedOrds.set(0, centroids.length - 1);
+
+        int[] filtered = CentroidPlanner.plan(
+            clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, clusterSizes),
+            new float[DIMENSION],
+            PlanParams.of(centroids.length),
+            centroids.length - 1,
+            acceptDocs(acceptedOrds),
+            DENSE_FIELD
+        );
+
+        assertArrayEquals(IntStream.range(0, centroids.length - 1).toArray(), filtered);
+    }
+
+    @Test
+    void testPlanFiltered_whenKIsOneBelowTheAcceptedVectors_thenUsesExactlyMaxProbes() throws IOException {
+        float[][] centroids = new float[129][DIMENSION];
+        int[] clusterSizes = new int[centroids.length];
+        for (int ordinal = 0; ordinal < centroids.length; ordinal++) {
+            centroids[ordinal][0] = ordinal + 1;
+            clusterSizes[ordinal] = 1;
+        }
+        FixedBitSet acceptedOrds = new FixedBitSet(centroids.length);
+        acceptedOrds.set(0, centroids.length - 1);
+        PlanParams params = PlanParams.of(centroids.length);
+
+        int[] filtered = CentroidPlanner.plan(
+            clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, clusterSizes),
+            new float[DIMENSION],
+            params,
+            centroids.length - 2,
+            acceptDocs(acceptedOrds),
+            DENSE_FIELD
+        );
+
+        assertArrayEquals(IntStream.range(0, params.maxProbes()).toArray(), filtered);
+    }
+
+    @Test
+    void testPlanFiltered_whenSparseKCoversAcceptedVectorsButNotAcceptedDocuments_thenPlansEveryEligibleCentroid() throws IOException {
+        float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 3f, 0f } };
+        int[] ordToCentroid = { 0, 1, 2 };
+        int[] vectorDocs = { 2, 5, 8 };
+        FixedBitSet acceptedDocs = new FixedBitSet(11);
+        // Two accepted vector documents, in clusters 0 and 1, and two accepted documents without a vector.
+        acceptedDocs.set(0);
+        acceptedDocs.set(2);
+        acceptedDocs.set(5);
+        acceptedDocs.set(6);
+
+        SparseField sparse = sparseField(centroids, ordToCentroid, vectorDocs, acceptedDocs.length());
+
+        int[] probes = CentroidPlanner.plan(
+            sparse.clusters(),
+            new float[] { 0f, 0f },
+            new PlanParams(1, 1),
+            2,
+            acceptDocs(acceptedDocs),
+            sparse.vectorDocs()
+        );
+
+        assertArrayEquals(new int[] { 0, 1 }, probes);
+    }
+
+    @Test
+    void testPlanFiltered_whenSparseKIsBelowTheAcceptedVectors_thenUsesExactlyMaxProbes() throws IOException {
+        float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 3f, 0f } };
+        int[] ordToCentroid = { 0, 1, 2 };
+        int[] vectorDocs = { 2, 5, 8 };
+        FixedBitSet acceptedDocs = new FixedBitSet(11);
+        acceptedDocs.set(0);
+        acceptedDocs.set(2);
+        acceptedDocs.set(5);
+        acceptedDocs.set(6);
+
+        SparseField sparse = sparseField(centroids, ordToCentroid, vectorDocs, acceptedDocs.length());
+
+        int[] probes = CentroidPlanner.plan(
+            sparse.clusters(),
+            new float[] { 0f, 0f },
+            new PlanParams(1, 1),
+            1,
+            acceptDocs(acceptedDocs),
+            sparse.vectorDocs()
+        );
+
+        assertArrayEquals(new int[] { 0 }, probes);
     }
 
     @Test
@@ -245,6 +350,7 @@ class CentroidPlannerFilteringTest {
             clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, clusterSizes, ordToCentroid, open("clap", 3000)),
             new float[] { 0f, 0f },
             new PlanParams(1, centroids.length),
+            K,
             acceptDocs(acceptedOrds),
             DENSE_FIELD
         );
@@ -269,6 +375,7 @@ class CentroidPlannerFilteringTest {
             clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, new int[] { 7, 6, 6 }, ordToCentroid, open("clap", 3000)),
             new float[] { 0f, 0f },
             new PlanParams(1, centroids.length),
+            K,
             acceptDocs(acceptedOrds),
             DENSE_FIELD
         );
@@ -290,6 +397,7 @@ class CentroidPlannerFilteringTest {
             sparse.clusters(),
             new float[] { 0f, 0f },
             new PlanParams(1, centroids.length),
+            K,
             acceptDocs(acceptedDocs),
             sparse.vectorDocs()
         );
@@ -318,6 +426,7 @@ class CentroidPlannerFilteringTest {
             sparse.clusters(),
             new float[] { 0f, 0f },
             new PlanParams(1, centroids.length),
+            K,
             acceptDocs(acceptedDocs),
             sparse.vectorDocs()
         );
@@ -342,6 +451,7 @@ class CentroidPlannerFilteringTest {
             sparse.clusters(),
             new float[] { 0f, 0f },
             new PlanParams(1, centroids.length),
+            K,
             acceptDocs(acceptedDocs),
             sparse.vectorDocs()
         );
@@ -363,6 +473,7 @@ class CentroidPlannerFilteringTest {
             clusters,
             new float[] { 0f, 0f },
             new PlanParams(1, centroids.length),
+            K,
             acceptDocs(acceptedOrds),
             DENSE_FIELD
         );

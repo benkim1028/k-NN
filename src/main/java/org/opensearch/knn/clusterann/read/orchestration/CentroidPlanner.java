@@ -25,7 +25,8 @@ import java.util.List;
  * Chooses which clusters a query should visit.
  *
  * <p>Sweeps every centroid, keeps the {@code maxProbes} nearest non-empty clusters, and returns their ordinals
- * closest-first. The scan relies on that order and does not restore it.
+ * closest-first. Under a filter whose accepted vectors all fit in {@code k}, it keeps every cluster holding one
+ * instead. The scan relies on that order and does not restore it.
  *
  * <p>Ranks on a distance-like key (smaller is closer)
  *
@@ -46,9 +47,13 @@ public final class CentroidPlanner {
      * docs, so a match-all filter on a segment without deletions arrives here with null bits. Any other filter takes
      * the filtered path, even if it happens to accept every document.
      *
+     * <p>When every accepted vector fits in {@code k}, the caller wants all of them, so every centroid holding one is
+     * probed rather than only the {@code maxProbes} nearest.
+     *
      * @param clusters the field's clusters
      * @param query the query vector, in the space it arrived in; not modified
      * @param params the bounds to choose within
+     * @param k the number of results the caller wants
      * @param acceptDocs document-space filter, or null for an unfiltered search
      * @param vectorDocsSupplier a new iterator over the documents that have this vector field, exposing each one's
      *     vector ordinal; called only when a sparse field is filtered
@@ -58,6 +63,7 @@ public final class CentroidPlanner {
         Clusters clusters,
         float[] query,
         PlanParams params,
+        int k,
         AcceptDocs acceptDocs,
         IOSupplier<KnnVectorValues.DocIndexIterator> vectorDocsSupplier
     ) throws IOException {
@@ -71,18 +77,22 @@ public final class CentroidPlanner {
         final LongValues ordToCentroid = clusters.ordToCentroid();
         final FixedBitSet acceptedCentroids = new FixedBitSet(clusters.numClusters());
         final DocIdSetIterator acceptedDocs = acceptDocs.iterator();
+        int acceptedVectors = 0;
         if (clusters.hasDenseVectorValues()) {
             for (int doc = acceptedDocs.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = acceptedDocs.nextDoc()) {
                 acceptedCentroids.set((int) ordToCentroid.get(doc));
+                acceptedVectors++;
             }
         } else {
             final KnnVectorValues.DocIndexIterator vectorDocs = vectorDocsSupplier.get();
             final DocIdSetIterator acceptedVectorDocs = ConjunctionUtils.intersectIterators(List.of(acceptedDocs, vectorDocs));
             while (acceptedVectorDocs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
                 acceptedCentroids.set((int) ordToCentroid.get(vectorDocs.index()));
+                acceptedVectors++;
             }
         }
-        return planEligible(clusters, query, params, acceptedCentroids);
+        final int maxProbes = acceptedVectors <= k ? acceptedCentroids.cardinality() : params.maxProbes();
+        return planEligible(clusters, query, maxProbes, acceptedCentroids);
     }
 
     /**
@@ -119,8 +129,7 @@ public final class CentroidPlanner {
     }
 
     /** Rank only the centroids the filter reaches, using the same plain distance key as unfiltered planning. */
-    private static int[] planEligible(Clusters clusters, float[] query, PlanParams params, FixedBitSet acceptedCentroids)
-        throws IOException {
+    private static int[] planEligible(Clusters clusters, float[] query, int maxProbes, FixedBitSet acceptedCentroids) throws IOException {
         int numClusters = clusters.numClusters();
         if (numClusters == 0 || acceptedCentroids.cardinality() == 0) {
             return NO_PROBES;
@@ -130,7 +139,7 @@ public final class CentroidPlanner {
         final CentroidVectorValues centroids = clusters.centroids();
         float queryNormSq = similarity == VectorSimilarityFunction.EUCLIDEAN ? VectorUtil.dotProduct(query, query) : 0f;
 
-        final NeighborQueue nearest = new NeighborQueue(params.maxProbes(), true);
+        final NeighborQueue nearest = new NeighborQueue(maxProbes, true);
         for (int ordinal = acceptedCentroids.nextSetBit(0); ordinal != DocIdSetIterator.NO_MORE_DOCS && ordinal < numClusters; ordinal =
             ordinal + 1 < acceptedCentroids.length() ? acceptedCentroids.nextSetBit(ordinal + 1) : DocIdSetIterator.NO_MORE_DOCS) {
             if (clusters.clusterSize(ordinal) != 0) {

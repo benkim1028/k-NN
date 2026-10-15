@@ -318,6 +318,7 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
             fieldClusters,
             query,
             PlanParams.of(fieldClusters.numClusters()),
+            knnCollector.k(),
             acceptDocs,
             () -> IndexedDISI.asDocIndexIterator(ordToDocConfig.getIndexedDISI(postings))
         );
