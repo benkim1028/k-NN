@@ -9,6 +9,7 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
+import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.index.FieldInfo;
@@ -62,6 +63,12 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
     private final IntObjectHashMap<Clusters> clusters;
 
     /**
+     * One ord&rarr;doc mapping per vector field, by field number — read over the whole {@code .clap}, where its
+     * offsets point, so it is built once here and shared by every search of this segment rather than per query.
+     */
+    private final IntObjectHashMap<LongValues> ordToDocs;
+
+    /**
      * The data files, opened only when a field actually has clusters. Held for the segment's lifetime because every
      * {@link Clusters} reads through clones of them; closed with this reader.
      *
@@ -83,6 +90,7 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
         this.segmentReadState = state;
         this.fields = new IntObjectHashMap<>();
         this.clusters = new IntObjectHashMap<>();
+        this.ordToDocs = new IntObjectHashMap<>();
         this.fieldInfos = state.fieldInfos;
         boolean success = false;
 
@@ -146,6 +154,7 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                         field.value
                     )
                 );
+                ordToDocs.put(field.key, ordToDoc(fieldMeta.ordToDoc(), postings));
             }
             success = true;
         } finally {
@@ -239,12 +248,17 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
             throw new IllegalArgumentException("fieldName, query, knn collector and  vector cannot be null");
         }
 
-        Clusters fieldClusters = clusters(fieldName);
-        if (fieldClusters == null) {
+        final FieldInfo fieldInfo = fieldInfos.fieldInfo(fieldName);
+        if (fieldInfo == null) {
+            log.debug("search: segment [{}] has no field [{}]", segmentReadState.segmentInfo.name, fieldName);
+            return;
+        }
+        final Clusters fieldClusters = clusters.get(fieldInfo.number);
+        if (fieldClusters == null) {        // the field has no vectors in this segment
             return;
         }
 
-        final LongValues ordToDoc = fieldClusters.ordToDoc();
+        final LongValues ordToDoc = ordToDocs.get(fieldInfo.number);
         final OrdinalTranslatedKnnCollector translatedKnnCollector = new OrdinalTranslatedKnnCollector(
             knnCollector,
             (ord) -> Math.toIntExact(ordToDoc.get(ord))
@@ -278,11 +292,6 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
         };
     }
 
-    private Clusters clusters(String fieldName) {
-        FieldInfo info = fieldInfos.fieldInfo(fieldName);
-        return info == null ? null : clusters.get(info.number);
-    }
-
     /**
      * Finds the nearest neighbors of a byte query vector, feeding matches to the collector.
      *
@@ -294,6 +303,13 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
     @Override
     public void search(String fieldName, byte[] query, KnnCollector knnCollector, AcceptDocs acceptDocs) {
         throw new UnsupportedOperationException("Search on byte vector not supported with cluster ann");
+    }
+
+    private static LongValues ordToDoc(final OrdToDocDISIReaderConfiguration config, final IndexInput postings) throws IOException {
+        if (config.isDense() || config.isEmpty()) {
+            return LongValues.IDENTITY;
+        }
+        return config.getDirectMonotonicReader(postings);
     }
 
     /**

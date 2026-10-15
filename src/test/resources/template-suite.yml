@@ -70,6 +70,10 @@ defaults:
     # approximate search returns fewer than k hits) would be reported as that format's recall.
     expectFiles: []
 
+    # Vector docs per nested block. Above 0, each block is that many vector-bearing children followed by a parent
+    # with no vector, the way OpenSearch indexes a nested field, so the field is sparse. 0 indexes one doc per vector.
+    childrenPerParent: 0
+
   search:
     # Neighbours requested per query. Cannot exceed the ground-truth depth available.
     k: 10

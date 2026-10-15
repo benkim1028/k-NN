@@ -5,10 +5,8 @@
 
 package org.opensearch.knn.clusterann.read;
 
-import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
-import org.apache.lucene.util.LongValues;
 import org.opensearch.knn.clusterann.read.orchestration.ClusterScan;
 import org.opensearch.knn.clusterann.read.orchestration.ScanContext;
 import org.opensearch.knn.clusterann.format.rotation.Rotation;
@@ -31,37 +29,32 @@ public final class Clusters {
 
     private final ClusterANNFieldMeta fieldMeta;
     private final ClusterFactory clusterFactory;
-    private final LongValues ordToDoc;
     private final CentroidVectorValues centroidsBase;
     private final Rotation rotation;
 
     /**
-     * @param postings the {@code .clap} file; a cluster's own posting is sliced out of it per {@link #get}
-     * @param centroids the {@code .clac} file
-     * @param rotation the {@code .clar} file
-     * @param fieldMeta this field's entry from {@code .clam}
+     * @param postingsSlice  this field's region of {@code .clap}, already cut at {@code clapOffset}; a cluster's own
+     *     posting is sliced out of it per {@link #get}
+     * @param centroidsSlice this field's region of {@code .clac}, already cut at {@code clacOffset}
+     * @param rotationSlice  this field's region of {@code .clar}, or {@code null} when the field stores no rotation
+     * @param fieldMeta      this field's entry from {@code .clam}
      */
     public Clusters(
-        final IndexInput postings,
-        final IndexInput centroids,
-        @Nullable final IndexInput rotation,
+        final IndexInput postingsSlice,
+        final IndexInput centroidsSlice,
+        @Nullable final IndexInput rotationSlice,
         final ClusterANNFieldMeta fieldMeta
     ) throws IOException {
         this.fieldMeta = fieldMeta;
-        this.ordToDoc = ordToDoc(fieldMeta.ordToDoc(), postings);
-        this.clusterFactory = new ClusterFactory(fieldMeta, postings, centroids, rotation);
-        this.rotation = RotationFormats.read(fieldMeta.rotationId(), rotation, fieldMeta.dimension());
+        this.clusterFactory = new ClusterFactory(fieldMeta, postingsSlice, centroidsSlice, rotationSlice);
+        this.rotation = RotationFormats.read(fieldMeta.rotationId(), rotationSlice, fieldMeta.dimension());
 
         long centroidsBytes = (long) fieldMeta.centroidCount() * floatsPerCentroid(fieldMeta.dimension()) * Float.BYTES;
         this.centroidsBase = new CentroidVectorValues(
-            centroids.slice("centroids", fieldMeta.clacCentroidsOffset(), centroidsBytes),
+            centroidsSlice.slice("centroids", fieldMeta.clacCentroidsOffset(), centroidsBytes),
             fieldMeta.centroidCount(),
             fieldMeta.dimension()
         );
-    }
-
-    public LongValues ordToDoc() {
-        return ordToDoc;
     }
 
     /**
@@ -128,12 +121,5 @@ public final class Clusters {
      */
     public Cluster get(int ordinal) throws IOException {
         return clusterFactory.create(ordinal);
-    }
-
-    private static LongValues ordToDoc(OrdToDocDISIReaderConfiguration config, IndexInput postings) throws IOException {
-        if (config.isDense() || config.isEmpty()) {
-            return LongValues.IDENTITY;
-        }
-        return config.getDirectMonotonicReader(postings);
     }
 }

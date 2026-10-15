@@ -47,7 +47,7 @@ public final class Suite {
         "similarity",
         "file"
     );
-    private static final Set<String> INDEX_KEYS = Set.of("docsPerSegment", "expectFiles", "forceMerge");
+    private static final Set<String> INDEX_KEYS = Set.of("docsPerSegment", "expectFiles", "forceMerge", "childrenPerParent");
     private static final Set<String> SEARCH_KEYS = Set.of("k", "queries", "repeat", "warmup", "threads", "scoreTolerance", "scoreBias");
     private static final Set<String> CODEC_KEYS = Set.of("name", "params");
 
@@ -182,7 +182,12 @@ public final class Suite {
         return new Scenario(
             name,
             corpusSpec,
-            new Scenario.IndexSpec(integer(index, "docsPerSegment", 1_000), strings(index, "expectFiles"), segments(index)),
+            new Scenario.IndexSpec(
+                integer(index, "docsPerSegment", 1_000),
+                strings(index, "expectFiles"),
+                segments(index),
+                childrenPerParent(index)
+            ),
             searchSpec,
             new Scenario.CodecSpec(string(codec, "name", DEFAULT_CODEC), params(codec))
         );
@@ -229,6 +234,14 @@ public final class Suite {
             throw new IllegalArgumentException("\"forceMerge\" must be at least 1 segment, got " + segments);
         }
         return segments.intValue();
+    }
+
+    private static int childrenPerParent(final Map<String, Object> section) {
+        final int children = integer(section, "childrenPerParent", 0);
+        if (children < 0) {
+            throw new IllegalArgumentException("\"childrenPerParent\" must be 0 (flat) or a positive number, got " + children);
+        }
+        return children;
     }
 
     private static List<String> strings(final Map<String, Object> section, final String key) {

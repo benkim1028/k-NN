@@ -17,7 +17,11 @@ public record Scenario(String name, CorpusSpec corpus, IndexSpec index, SearchSp
         double spread, int depth, long seed, VectorSimilarityFunction similarity, String file) {
     }
 
-    public record IndexSpec(int docsPerSegment, List<String> expectFiles, Integer forceMerge) {
+    /**
+     * {@code childrenPerParent} above 0 indexes the corpus the way OpenSearch indexes a nested field: each vector in
+     * its own child document, written as a block of that many children followed by a parent that has no vector.
+     */
+    public record IndexSpec(int docsPerSegment, List<String> expectFiles, Integer forceMerge, int childrenPerParent) {
     }
 
     public record SearchSpec(int k, int queries, int repeat, int warmup, int threads, double scoreTolerance, double scoreBias) {

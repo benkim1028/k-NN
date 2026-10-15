@@ -14,8 +14,11 @@ import org.apache.lucene.document.Document;
 import org.apache.lucene.document.KnnFloatVectorField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.IndexableField;
+import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.KnnFloatVectorQuery;
@@ -161,11 +164,22 @@ public class KNNVectorFormatsComponentTest extends LuceneTestCase {
 
             final long indexStart = System.nanoTime();
             try (FlightRecording recording = FlightRecording.start(phase("index")); IndexWriter writer = new IndexWriter(dir, config())) {
-                for (int row = 0; row < corpus.size(); row++) {
-                    final Document document = new Document();
-                    document.add(new KnnFloatVectorField(VECTOR_FIELD, corpus.vector(row), corpus.similarity()));
-                    document.add(new StoredField(ROW_FIELD, row));
-                    writer.addDocument(document);
+                final int children = scenario.index().childrenPerParent();
+                if (children == 0) {
+                    for (int row = 0; row < corpus.size(); row++) {
+                        writer.addDocument(vectorDocument(row));
+                    }
+                } else {
+                    // OpenSearch's nested layout: one block per parent, its children first and the parent last, so
+                    // the vector field is sparse and a vector's ordinal differs from its doc ID.
+                    for (int first = 0; first < corpus.size(); first += children) {
+                        final List<Document> block = new ArrayList<>(children + 1);
+                        for (int row = first; row < Math.min(first + children, corpus.size()); row++) {
+                            block.add(vectorDocument(row));
+                        }
+                        block.add(new Document());
+                        writer.addDocuments(block);
+                    }
                 }
                 writer.commit();
             }
@@ -187,7 +201,8 @@ public class KNNVectorFormatsComponentTest extends LuceneTestCase {
 
             try (DirectoryReader reader = DirectoryReader.open(dir)) {
                 log.info("{} docs in {} segments", reader.numDocs(), reader.leaves().size());
-                assertEquals("every vector in the corpus must have been indexed", corpus.size(), reader.maxDoc());
+                assertEquals("every vector in the corpus must have been indexed", corpus.size(), vectorCount(reader));
+                assertEquals("one doc per vector plus one per parent", corpus.size() + parents(), reader.maxDoc());
                 if (segments != null) {
                     assertEquals("the corpus must have been merged into one segment", 1, reader.leaves().size());
                 }
@@ -212,6 +227,27 @@ public class KNNVectorFormatsComponentTest extends LuceneTestCase {
                 }
             }
         }
+    }
+
+    private Document vectorDocument(final int row) {
+        final Document document = new Document();
+        document.add(new KnnFloatVectorField(VECTOR_FIELD, corpus.vector(row), corpus.similarity()));
+        document.add(new StoredField(ROW_FIELD, row));
+        return document;
+    }
+
+    private int parents() {
+        final int children = scenario.index().childrenPerParent();
+        return children == 0 ? 0 : (corpus.size() + children - 1) / children;
+    }
+
+    private static int vectorCount(final DirectoryReader reader) throws Exception {
+        int count = 0;
+        for (final LeafReaderContext leaf : reader.leaves()) {
+            final FloatVectorValues values = leaf.reader().getFloatVectorValues(VECTOR_FIELD);
+            count += values == null ? 0 : values.size();
+        }
+        return count;
     }
 
     private void assertExpectedFilesExist(final Directory dir) throws Exception {
@@ -382,7 +418,11 @@ public class KNNVectorFormatsComponentTest extends LuceneTestCase {
     }
 
     private static int rowOf(final IndexSearcher searcher, final int doc) throws Exception {
-        return searcher.storedFields().document(doc).getField(ROW_FIELD).numericValue().intValue();
+        final IndexableField row = searcher.storedFields().document(doc).getField(ROW_FIELD);
+        // Only vector docs carry a row, so a hit without one is a parent: the ord -> doc mapping sent it to the
+        // wrong doc.
+        assertNotNull("hit doc " + doc + " has no vector, so its ordinal was mapped to the wrong doc", row);
+        return row.numericValue().intValue();
     }
 
     private void warmUp(final IndexSearcher searcher, final int queryCount) throws Exception {
