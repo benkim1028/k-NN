@@ -16,5 +16,25 @@ package org.opensearch.knn.clusterann.format;
 public enum ClusterANNEncoding {
 
     /** Lucene's optimized scalar quantization ({@code OptimizedScalarQuantizer}). */
-    OPTIMIZED_SCALAR_QUANTIZATION
+    OPTIMIZED_SCALAR_QUANTIZATION(ClusterANNFormatConstants.QUANTIZER_OPTIMIZED_SQ);
+
+    private final int quantizerId;
+
+    ClusterANNEncoding(int quantizerId) {
+        this.quantizerId = quantizerId;
+    }
+
+    /**
+     * The backend a {@code .clam} {@code quantizerId} names.
+     *
+     * @throws IllegalArgumentException if no backend has that id
+     */
+    public static ClusterANNEncoding fromQuantizerId(int quantizerId) {
+        for (ClusterANNEncoding encoding : values()) {
+            if (encoding.quantizerId == quantizerId) {
+                return encoding;
+            }
+        }
+        throw new IllegalArgumentException("Unsupported quantizerId: " + quantizerId);
+    }
 }

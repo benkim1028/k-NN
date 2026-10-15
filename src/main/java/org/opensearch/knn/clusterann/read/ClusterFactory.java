@@ -30,6 +30,7 @@ public final class ClusterFactory {
     private final IndexInput centroids;
     private final IndexInput rotation;
     private final ClusterANNFieldMeta fieldMeta;
+    private final ScoreComputer computer;
     /** The region a scan reads centroids from, cloned per cluster. Rotated when the field is, raw when it is not. */
     private final CentroidVectorValues centroidsBase;
 
@@ -38,9 +39,17 @@ public final class ClusterFactory {
      * @param clap this field's region of {@code .clap}, already cut at {@code clapOffset}
      * @param clac this field's region of {@code .clac}, already cut at {@code clacOffset}
      * @param clar this field's region of {@code .clar}, or {@code null} when the field stores no rotation
+     * @param computer scores the blocks of every cluster this factory creates
      */
-    public ClusterFactory(ClusterANNFieldMeta fieldMeta, IndexInput clap, IndexInput clac, @Nullable IndexInput clar) throws IOException {
+    public ClusterFactory(
+        ClusterANNFieldMeta fieldMeta,
+        IndexInput clap,
+        IndexInput clac,
+        @Nullable IndexInput clar,
+        ScoreComputer computer
+    ) throws IOException {
         this.fieldMeta = fieldMeta;
+        this.computer = computer;
         this.postings = clap;
         this.centroids = clac;
         this.rotation = clar;
@@ -84,7 +93,8 @@ public final class ClusterFactory {
             fieldMeta.dimension(),
             scalarEncoding(fieldMeta.docBits()),
             ScalarQuantizers.forSimilarity(fieldMeta.similarityFunction()),
-            fieldMeta.similarityFunction()
+            fieldMeta.similarityFunction(),
+            computer
         );
     }
 

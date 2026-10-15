@@ -27,9 +27,13 @@ import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.hnsw.OrdinalTranslatedKnnCollector;
+import org.opensearch.knn.clusterann.format.ClusterANNEncoding;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
 import org.opensearch.knn.clusterann.read.Clusters;
 import org.opensearch.knn.clusterann.read.ScanParams;
+import org.opensearch.knn.clusterann.read.ScoreComputer;
+import org.opensearch.knn.clusterann.read.ScoreComputerFactory;
+import org.opensearch.knn.clusterann.read.block.scalar.JavaAdcScoreComputer;
 import org.opensearch.knn.clusterann.read.orchestration.CentroidPlanner;
 import org.opensearch.knn.clusterann.read.orchestration.ClusterSearcher;
 import org.opensearch.knn.clusterann.read.orchestration.PlanParams;
@@ -74,12 +78,31 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
     private final IndexInput rotation;
 
     /**
-     * Creates a reader for a single segment.
+     * Creates a reader for a single segment that scores every field with the format's Java implementation.
      *
      * @param state    state describing the segment being read
      * @param rawFlatVectorsReader delegate reader that provides access to the raw vectors
      */
     public KNN1030ClusterANNVectorsReader(final SegmentReadState state, final FlatVectorsReader rawFlatVectorsReader) throws IOException {
+        this(state, rawFlatVectorsReader, ScoreComputerFactory.NONE);
+    }
+
+    /**
+     * Creates a reader for a single segment.
+     *
+     * <p>Once a field's metadata is read, {@code scoreComputerFactory} is asked for that field's
+     * {@link ScoreComputer}; {@code null} selects {@link JavaAdcScoreComputer}. The choice is made once per field here
+     * and holds for the life of the reader.
+     *
+     * @param state    state describing the segment being read
+     * @param rawFlatVectorsReader delegate reader that provides access to the raw vectors
+     * @param scoreComputerFactory supplies the computer each field is scored with
+     */
+    public KNN1030ClusterANNVectorsReader(
+        final SegmentReadState state,
+        final FlatVectorsReader rawFlatVectorsReader,
+        final ScoreComputerFactory scoreComputerFactory
+    ) throws IOException {
         this.rawFlatVectorsReader = rawFlatVectorsReader;
         this.segmentReadState = state;
         this.fields = new IntObjectHashMap<>();
@@ -138,13 +161,15 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                 final int fieldNumber = field.key;
                 final ClusterANNFieldMeta fieldMeta = field.value;
                 final String suffix = String.join("-", String.valueOf(fieldNumber), segmentReadState.segmentSuffix);
+                final ScoreComputer computer = resolveScoreComputer(scoreComputerFactory, fieldNumber, fieldMeta);
                 clusters.put(
                     field.key,
                     new Clusters(
                         postings.slice("clap_" + suffix, fieldMeta.clapOffset(), fieldMeta.clapLength()),
                         centroids.slice("centroids_" + suffix, fieldMeta.clacOffset(), fieldMeta.clacLength()),
                         rotationSlice(fieldMeta, suffix),
-                        field.value
+                        field.value,
+                        computer
                     )
                 );
             }
@@ -154,6 +179,40 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                 IOUtils.closeWhileHandlingException(this);
             }
         }
+    }
+
+    /**
+     * The computer one field is scored with: the factory's answer, or the format's Java implementation when the factory
+     * returns {@code null}. A supplied computer is logged at INFO so a segment's choice can be read off the log; the
+     * default stays at DEBUG.
+     */
+    private ScoreComputer resolveScoreComputer(
+        final ScoreComputerFactory factory,
+        final int fieldNumber,
+        final ClusterANNFieldMeta fieldMeta
+    ) {
+        final ClusterANNEncoding quantizer = ClusterANNEncoding.fromQuantizerId(fieldMeta.quantizerId());
+        final ScoreComputer supplied = factory.create(quantizer, fieldMeta);
+        if (supplied == null) {
+            log.debug(
+                "segment [{}] field [{}]: scoring {} {}-bit codes with {}",
+                segmentReadState.segmentInfo.name,
+                fieldNumber,
+                quantizer,
+                fieldMeta.docBits(),
+                JavaAdcScoreComputer.class.getName()
+            );
+            return JavaAdcScoreComputer.INSTANCE;
+        }
+        log.info(
+            "segment [{}] field [{}]: scoring {} {}-bit codes with {}",
+            segmentReadState.segmentInfo.name,
+            fieldNumber,
+            quantizer,
+            fieldMeta.docBits(),
+            supplied.getClass().getName()
+        );
+        return supplied;
     }
 
     /**

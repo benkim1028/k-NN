@@ -38,15 +38,17 @@ public final class Clusters {
      * @param centroidsSlice this field's region of {@code .clac}, already cut at {@code clacOffset}
      * @param rotationSlice  this field's region of {@code .clar}, or {@code null} when the field stores no rotation
      * @param fieldMeta      this field's entry from {@code .clam}
+     * @param computer       scores the blocks of this field's clusters; the field's choice at reader open
      */
     public Clusters(
         final IndexInput postingsSlice,
         final IndexInput centroidsSlice,
         @Nullable final IndexInput rotationSlice,
-        final ClusterANNFieldMeta fieldMeta
+        final ClusterANNFieldMeta fieldMeta,
+        final ScoreComputer computer
     ) throws IOException {
         this.fieldMeta = fieldMeta;
-        this.clusterFactory = new ClusterFactory(fieldMeta, postingsSlice, centroidsSlice, rotationSlice);
+        this.clusterFactory = new ClusterFactory(fieldMeta, postingsSlice, centroidsSlice, rotationSlice, computer);
         this.rotation = RotationFormats.read(fieldMeta.rotationId(), rotationSlice, fieldMeta.dimension());
 
         long centroidsBytes = (long) fieldMeta.centroidCount() * floatsPerCentroid(fieldMeta.dimension()) * Float.BYTES;

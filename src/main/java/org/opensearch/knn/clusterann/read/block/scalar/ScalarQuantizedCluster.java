@@ -16,6 +16,7 @@ import org.opensearch.knn.clusterann.read.Centroid;
 import org.opensearch.knn.clusterann.read.Cluster;
 import org.opensearch.knn.clusterann.read.PostingScorer;
 import org.opensearch.knn.clusterann.read.ScanParams;
+import org.opensearch.knn.clusterann.read.ScoreComputer;
 import org.opensearch.knn.clusterann.read.block.BlockPostingScorer;
 import org.opensearch.knn.clusterann.read.orchestration.ScanContext;
 
@@ -53,6 +54,7 @@ public class ScalarQuantizedCluster implements Cluster {
     private final ScalarEncoding encoding;
     private final OptimizedScalarQuantizer quantizer;
     private final VectorSimilarityFunction similarityFunction;
+    private final ScoreComputer computer;
 
     /** Bytes before block 0. Arithmetic, not measured, which is what keeps the constructor free of IO. */
     private final long headerBytes;
@@ -78,6 +80,7 @@ public class ScalarQuantizedCluster implements Cluster {
      * @param encoding stored code width, which also fixes the packed bytes per vector
      * @param quantizer quantizes the query into the same space as the stored codes
      * @param similarityFunction the field's similarity, which selects the ADC transform
+     * @param computer scores each block's accepted positions; the field's choice at reader open
      */
     @SuppressWarnings("checkstyle:ParameterNumber")
     public ScalarQuantizedCluster(
@@ -89,8 +92,10 @@ public class ScalarQuantizedCluster implements Cluster {
         int dimension,
         ScalarEncoding encoding,
         OptimizedScalarQuantizer quantizer,
-        VectorSimilarityFunction similarityFunction
+        VectorSimilarityFunction similarityFunction,
+        ScoreComputer computer
     ) throws IOException {
+        this.computer = computer;
         this.posting = posting;
         this.ordinal = ordinal;
         this.clusterSize = clusterSize;
@@ -139,7 +144,17 @@ public class ScalarQuantizedCluster implements Cluster {
         }
 
         load();
-        ScalarQuantizedBlockScorer scorer = new ScalarQuantizedBlockScorer(reader, sqScanContext, encoding, similarityFunction);
+        SQComputeContext computeContext = new SQComputeContext(
+            reader.codes(),
+            reader.lower(),
+            reader.upper(),
+            reader.addCor(),
+            reader.sum(),
+            encoding,
+            encoding.getDocPackedLength(dimension),
+            sqScanContext
+        );
+        ScalarQuantizedBlockScorer scorer = new ScalarQuantizedBlockScorer(reader, computeContext, computer);
         return new BlockPostingScorer(scorer, ordinals, acceptedOrds);
     }
 
@@ -185,7 +200,8 @@ public class ScalarQuantizedCluster implements Cluster {
             lower,
             scale,
             quantized.quantizedComponentSum(),
-            quantized.additionalCorrection()
+            quantized.additionalCorrection(),
+            similarityFunction
         );
     }
 

@@ -20,6 +20,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.InOrder;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
+import org.opensearch.knn.clusterann.read.block.scalar.JavaAdcScoreComputer;
 import org.opensearch.knn.clusterann.format.ClusterANNFormatConstants;
 import org.opensearch.knn.clusterann.read.orchestration.ClusterScan;
 import org.opensearch.knn.clusterann.read.orchestration.ScanContext;
@@ -255,7 +256,7 @@ class ClustersTests {
 
     private Clusters clusters(VectorSimilarityFunction similarity, IndexInput centroids) throws IOException {
         // The inputs are the field's own regions, cut at clapOffset and clacOffset, as the reader hands them over.
-        return new Clusters(open("clap", 3000), centroids, null, fieldMeta(similarity));
+        return new Clusters(open("clap", 3000), centroids, null, fieldMeta(similarity), JavaAdcScoreComputer.INSTANCE);
     }
 
     private static ClusterANNFieldMeta fieldMeta(VectorSimilarityFunction similarity) throws IOException {
