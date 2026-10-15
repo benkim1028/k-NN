@@ -39,7 +39,7 @@ class PlanParamsTests {
         PlanParams params = PlanParams.of(numCentroids);
 
         // then
-        assertEquals(PlanParams.NPROBE_MULTIPLIER * root, params.maxProbes());
+        assertEquals((int) Math.ceil(PlanParams.multiplier(1.0) * root), params.maxProbes());
         assertEquals(Math.max(PlanParams.MIN_NPROBE, root), params.minProbes());
     }
 
@@ -86,6 +86,18 @@ class PlanParamsTests {
         assertTrue(params.minProbes() >= 1, "minProbes " + params.minProbes());
         assertTrue(params.minProbes() <= params.maxProbes(), params.minProbes() + " > " + params.maxProbes());
         assertTrue(params.maxProbes() <= Math.max(1, numCentroids), "maxProbes " + params.maxProbes());
+    }
+
+    @ParameterizedTest(name = "s = {0}")
+    @CsvSource({ "1.0, 3.0", "0.25, 4.174802103936399", "0.01, 10.283177667225557", "0.001, 21.0", "0.0001, 32.0", "0.0, 32.0" })
+    void testMultiplier_cubeRootAndCap(double selectivity, double multiplier) {
+        assertEquals(multiplier, PlanParams.multiplier(selectivity), 1e-12);
+    }
+
+    @ParameterizedTest(name = "s = {0}")
+    @CsvSource({ "1.0, 153", "0.25, 213", "0.001, 1071" })
+    void testForSelectivity_ceilingOnBenchmarkedField(double selectivity, int maxProbes) {
+        assertEquals(maxProbes, PlanParams.forSelectivity(2601, selectivity).maxProbes());
     }
 
     // ---------------------------------------------------------------- invariants

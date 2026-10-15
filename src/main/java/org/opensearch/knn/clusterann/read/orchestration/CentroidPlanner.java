@@ -56,7 +56,7 @@ public final class CentroidPlanner {
      *
      * @param clusters the field's clusters
      * @param query the query vector, in the space it arrived in; not modified
-     * @param params the bounds to choose within
+     * @param params the bounds to choose within; a selective filter may raise the ceiling above {@code maxProbes}
      * @param k the number of results the caller wants
      * @param acceptDocs document-space filter, or null for an unfiltered search
      * @param vectorDocsSupplier a new iterator over the documents that have this vector field, exposing each one's
@@ -99,7 +99,9 @@ public final class CentroidPlanner {
         if (eligibleClusters == 0) {
             return NO_PROBES;
         }
-        final int maxProbes = acceptedVectors <= k ? eligibleClusters : params.maxProbes();
+        final double selectivity = (double) acceptedVectors / clusters.numVectors();
+        final int budget = PlanParams.forSelectivity(clusters.numClusters(), selectivity).maxProbes();
+        final int maxProbes = acceptedVectors <= k ? eligibleClusters : Math.max(budget, params.maxProbes());
         return probes(clusters, query, maxProbes, params.minProbes(), acceptedCentroids);
     }
 

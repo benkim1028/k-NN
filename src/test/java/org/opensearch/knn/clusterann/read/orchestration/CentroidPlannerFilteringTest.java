@@ -51,6 +51,10 @@ class CentroidPlannerFilteringTest {
     private static final int[] CLUSTER_SIZES = { 4, 4, 4 };
     /** Too small to cover the accepted vectors wherever the probe cap matters, so those tests still see the cap. */
     private static final int K = 1;
+    /** Wide enough for the probe budget to bind: root 20, so 60 probes unfiltered and more under a filter. */
+    private static final int WIDE_CLUSTERS = 400;
+    private static final int WIDE_CLUSTER_SIZE = 25;
+    private static final int WIDE_VECTORS = WIDE_CLUSTERS * WIDE_CLUSTER_SIZE;
     private static final IOSupplier<KnnVectorValues.DocIndexIterator> DENSE_FIELD = () -> {
         throw new AssertionError("a dense field maps documents to ordinals directly and must not read its vector docs");
     };
@@ -236,7 +240,8 @@ class CentroidPlannerFilteringTest {
             DENSE_FIELD
         );
 
-        assertEquals(params.maxProbes(), filtered.length);
+        // s = 128/129, budget (34) exceeds params.maxProbes (33)
+        assertEquals(34, filtered.length);
     }
 
     @Test
@@ -309,7 +314,8 @@ class CentroidPlannerFilteringTest {
             DENSE_FIELD
         );
 
-        assertArrayEquals(IntStream.range(0, params.maxProbes()).toArray(), filtered);
+        // s = 128/129, m = 3.005, budget = ceil(3.005 * 11) = 34; exceeds params.maxProbes (33)
+        assertArrayEquals(IntStream.range(0, 34).toArray(), filtered);
     }
 
     @Test
@@ -340,27 +346,59 @@ class CentroidPlannerFilteringTest {
 
     @Test
     void testPlanFiltered_whenSparseKIsBelowTheAcceptedVectors_thenUsesExactlyMaxProbes() throws IOException {
-        float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 3f, 0f } };
-        int[] ordToCentroid = { 0, 1, 2 };
-        int[] vectorDocs = { 2, 5, 8 };
-        FixedBitSet acceptedDocs = new FixedBitSet(11);
-        acceptedDocs.set(0);
-        acceptedDocs.set(2);
-        acceptedDocs.set(5);
-        acceptedDocs.set(6);
-
-        SparseField sparse = sparseField(centroids, ordToCentroid, vectorDocs, acceptedDocs.length());
+        SparseField sparse = wideSparseField();
+        FixedBitSet acceptedDocs = new FixedBitSet(2 * WIDE_VECTORS);
+        for (int cluster = 0; cluster < 200; cluster++) {
+            acceptedDocs.set(2 * cluster * WIDE_CLUSTER_SIZE);
+            acceptedDocs.set(2 * cluster + 1);
+        }
 
         int[] probes = CentroidPlanner.plan(
             sparse.clusters(),
-            new float[] { 0f, 0f },
-            new PlanParams(1, 1),
-            1,
+            new float[DIMENSION],
+            PlanParams.of(WIDE_CLUSTERS),
+            199,
             acceptDocs(acceptedDocs),
             sparse.vectorDocs()
         );
 
-        assertArrayEquals(new int[] { 0 }, probes);
+        // s = 200/10000 = 0.02, m(0.02) = 8.37, ceil(8.37 * 20) = 168
+        assertArrayEquals(IntStream.range(0, 168).toArray(), probes);
+    }
+
+    @Test
+    void testPlanFiltered_whenDense_thenBudgetsByTheExactAcceptedVectorCount() throws IOException {
+        FixedBitSet acceptedOrds = new FixedBitSet(WIDE_VECTORS);
+        for (int ordinal = 0; ordinal < WIDE_VECTORS; ordinal += 10) {
+            acceptedOrds.set(ordinal);
+        }
+
+        int[] probes = CentroidPlanner.plan(
+            wideDenseField(),
+            new float[DIMENSION],
+            PlanParams.of(WIDE_CLUSTERS),
+            K,
+            acceptDocs(acceptedOrds),
+            DENSE_FIELD
+        );
+
+        // s = 1000/10000 = 0.1, m(0.1) = 5.31, ceil(5.31 * 20) = 107
+        assertArrayEquals(IntStream.range(0, 107).toArray(), probes);
+
+        // Halve the accepted set (simulates deleted docs): s = 500/10000 = 0.05, ceil(6.43 * 20) = 129
+        FixedBitSet fewerAccepted = new FixedBitSet(WIDE_VECTORS);
+        for (int ordinal = 0; ordinal < WIDE_VECTORS; ordinal += 20) {
+            fewerAccepted.set(ordinal);
+        }
+        int[] fewerProbes = CentroidPlanner.plan(
+            wideDenseField(),
+            new float[DIMENSION],
+            PlanParams.of(WIDE_CLUSTERS),
+            K,
+            acceptDocs(fewerAccepted),
+            DENSE_FIELD
+        );
+        assertArrayEquals(IntStream.range(0, 129).toArray(), fewerProbes);
     }
 
     @Test
@@ -509,6 +547,32 @@ class CentroidPlannerFilteringTest {
         verify(clusters, never()).get(anyInt());
     }
 
+    /** {@link #WIDE_CLUSTERS} clusters of {@link #WIDE_CLUSTER_SIZE}; centroid {@code c} sits at {@code (c + 1, 0)}. */
+    private Clusters wideDenseField() throws IOException {
+        int[] clusterSizes = new int[WIDE_CLUSTERS];
+        Arrays.fill(clusterSizes, WIDE_CLUSTER_SIZE);
+        return clusters(VectorSimilarityFunction.EUCLIDEAN, wideCentroids(), clusterSizes);
+    }
+
+    /** The same clusters on a sparse field: only the even documents have a vector. */
+    private SparseField wideSparseField() throws IOException {
+        int[] ordToCentroid = new int[WIDE_VECTORS];
+        int[] vectorDocs = new int[WIDE_VECTORS];
+        for (int ordinal = 0; ordinal < WIDE_VECTORS; ordinal++) {
+            ordToCentroid[ordinal] = ordinal / WIDE_CLUSTER_SIZE;
+            vectorDocs[ordinal] = 2 * ordinal;
+        }
+        return sparseField(wideCentroids(), ordToCentroid, vectorDocs, 2 * WIDE_VECTORS);
+    }
+
+    private static float[][] wideCentroids() {
+        float[][] centroids = new float[WIDE_CLUSTERS][DIMENSION];
+        for (int ordinal = 0; ordinal < WIDE_CLUSTERS; ordinal++) {
+            centroids[ordinal][0] = ordinal + 1;
+        }
+        return centroids;
+    }
+
     private static FixedBitSet acceptedOrds(int... ordinals) {
         FixedBitSet acceptedOrds = new FixedBitSet(Arrays.stream(CLUSTER_SIZES).sum());
         for (int ordinal : ordinals) {
@@ -591,12 +655,20 @@ class CentroidPlannerFilteringTest {
                 ordToCentroid.length,
                 clac.length(),
                 clac.offsets().clacCentroidsOffset(),
-                new int[] { 1, 1, 1 },
+                clusterSizes(ordToCentroid, centroids.length),
                 ordToDoc
             ),
             JavaAdcScoreComputer.INSTANCE
         );
         return new SparseField(clusters, () -> IndexedDISI.asDocIndexIterator(ordToDoc.getIndexedDISI(postings)));
+    }
+
+    private static int[] clusterSizes(int[] ordToCentroid, int numClusters) {
+        int[] clusterSizes = new int[numClusters];
+        for (int centroid : ordToCentroid) {
+            clusterSizes[centroid]++;
+        }
+        return clusterSizes;
     }
 
     private IndexInput clapWithSecondary() throws IOException {
