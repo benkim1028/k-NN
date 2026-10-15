@@ -13,7 +13,8 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>Counted per segment scan rather than per query, because a query fans out over segments and it is the
  * per-segment work that the numbers are about. {@link #SEGMENT_SCANS} is the denominator that turns the totals
- * back into an average scan, which is what makes them comparable across runs of different sizes.
+ * back into an average scan, which is what makes them comparable across runs of different sizes; the filtered pair
+ * has its own denominator, {@link #FILTERED_SEGMENT_SCANS}.
  *
  * <p>Node-level totals since startup, in the same shape as {@link KNNGraphValue} — monotonic, never reset, so a
  * benchmark takes two readings and subtracts.
@@ -21,8 +22,8 @@ import java.util.concurrent.atomic.AtomicLong;
 public enum ClusterANNQueryValue {
 
     /**
-     * Segment scans completed. The denominator for the probe, scan, distance and block values; the filtered pair
-     * below has its own, {@link #FILTERED_SEGMENT_SCANS}.
+     * Segment scans with at least one probe, counted as the walk starts, so a scan that throws or times out still
+     * counts; a scan with nothing to probe does not. The denominator for the probe, scan, distance and block values.
      */
     SEGMENT_SCANS("segment_scans"),
 
