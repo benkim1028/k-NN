@@ -9,6 +9,7 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
+import org.opensearch.knn.clusterann.format.QuantizationParams;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -40,6 +41,21 @@ class KNN1030ClusterANNVectorsFormatTest {
     void getMaxDimensions_returnsConfiguredLimit_independentOfField() {
         assertEquals(16000, format.getMaxDimensions("float_field"));
         assertEquals(16000, format.getMaxDimensions("some_other_field"));
+    }
+
+    @Test
+    void constructor_throws_whenIoFetchBytesIsNotPositive() {
+        for (int ioFetchBytes : new int[] { 0, -1 }) {
+            IllegalArgumentException e = assertThrows(
+                IllegalArgumentException.class,
+                () -> new KNN1030ClusterANNVectorsFormat(
+                    KNN1030ClusterANNVectorsFormat.FORMAT_NAME,
+                    QuantizationParams.DEFAULT,
+                    ioFetchBytes
+                )
+            );
+            assertEquals("ioFetchBytes must be positive, got: " + ioFetchBytes, e.getMessage());
+        }
     }
 
     @Test

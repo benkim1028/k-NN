@@ -417,6 +417,28 @@ class CentroidPlannerFilteringTest {
     }
 
     @Test
+    void testPlanWithFilter_whenOnlyLiveDocs_thenCountsAFilteredScan() throws IOException {
+        resetStats();
+        float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 3f, 0f } };
+        // No query filter, one deleted vector in the first cluster: Lucene hands the segment its live docs as bits.
+        FixedBitSet liveDocs = new FixedBitSet(Arrays.stream(CLUSTER_SIZES).sum());
+        liveDocs.set(1, liveDocs.length());
+
+        int[] probes = CentroidPlanner.plan(
+            clusters(centroids),
+            new float[DIMENSION],
+            new PlanParams(1, centroids.length),
+            K,
+            AcceptDocs.fromLiveDocs(liveDocs, liveDocs.length()),
+            DENSE_FIELD
+        );
+
+        assertEquals(centroids.length, probes.length);
+        assertEquals(1L, ClusterANNQueryValue.FILTERED_SEGMENT_SCANS.getValue());
+        assertEquals(3L, ClusterANNQueryValue.ELIGIBLE_CLUSTERS.getValue());
+    }
+
+    @Test
     void testPlanFiltered_whenEligibleClustersExceedTheProbes_thenCountsEveryEligibleCluster() throws IOException {
         resetStats();
         float[][] centroids = new float[129][DIMENSION];

@@ -20,7 +20,10 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public enum ClusterANNQueryValue {
 
-    /** Segment scans completed. The denominator for every other value here. */
+    /**
+     * Segment scans completed. The denominator for the probe, scan, distance and block values; the filtered pair
+     * below has its own, {@link #FILTERED_SEGMENT_SCANS}.
+     */
     SEGMENT_SCANS("segment_scans"),
 
     /** Clusters the planner named, empty ones included — what {@code nprobe} actually worked out to. */
@@ -30,14 +33,16 @@ public enum ClusterANNQueryValue {
     CLUSTERS_SCANNED("clusters_scanned"),
 
     /**
-     * Segment scans that took the filtered planning path: a filter with non-null bits. The denominator for
-     * {@link #ELIGIBLE_CLUSTERS}; counted even when no cluster holds an accepted vector.
+     * Segment scans that took the filtered planning path: accept docs with non-null bits. That is a query filter, but
+     * also the live docs of a segment with deletions when there is no filter, so it is not a count of filtered
+     * queries. The denominator for {@link #ELIGIBLE_CLUSTERS}; counted even when no cluster holds an accepted vector,
+     * which {@link #SEGMENT_SCANS} does not count, so this can exceed it.
      */
     FILTERED_SEGMENT_SCANS("filtered_segment_scans"),
 
     /**
      * Clusters holding at least one accepted vector (by primary assignment), before the probe ceiling is applied:
-     * how much of the index a filter left eligible.
+     * how much of the index the accept docs left eligible.
      */
     ELIGIBLE_CLUSTERS("eligible_clusters"),
 
