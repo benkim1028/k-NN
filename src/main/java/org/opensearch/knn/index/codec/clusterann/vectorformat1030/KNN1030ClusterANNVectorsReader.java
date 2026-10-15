@@ -63,12 +63,6 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
     private final IntObjectHashMap<Clusters> clusters;
 
     /**
-     * One ord&rarr;doc mapping per vector field, by field number — read over the whole {@code .clap}, where its
-     * offsets point, so it is built once here and shared by every search of this segment rather than per query.
-     */
-    private final IntObjectHashMap<LongValues> ordToDocs;
-
-    /**
      * The data files, opened only when a field actually has clusters. Held for the segment's lifetime because every
      * {@link Clusters} reads through clones of them; closed with this reader.
      *
@@ -90,7 +84,6 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
         this.segmentReadState = state;
         this.fields = new IntObjectHashMap<>();
         this.clusters = new IntObjectHashMap<>();
-        this.ordToDocs = new IntObjectHashMap<>();
         this.fieldInfos = state.fieldInfos;
         boolean success = false;
 
@@ -154,7 +147,6 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                         field.value
                     )
                 );
-                ordToDocs.put(field.key, ordToDoc(fieldMeta.ordToDoc(), postings));
             }
             success = true;
         } finally {
@@ -248,17 +240,12 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
             throw new IllegalArgumentException("fieldName, query, knn collector and  vector cannot be null");
         }
 
-        final FieldInfo fieldInfo = fieldInfos.fieldInfo(fieldName);
-        if (fieldInfo == null) {
-            log.debug("search: segment [{}] has no field [{}]", segmentReadState.segmentInfo.name, fieldName);
-            return;
-        }
-        final Clusters fieldClusters = clusters.get(fieldInfo.number);
-        if (fieldClusters == null) {        // the field has no vectors in this segment
+        Clusters fieldClusters = clusters(fieldName);
+        if (fieldClusters == null) {
             return;
         }
 
-        final LongValues ordToDoc = ordToDocs.get(fieldInfo.number);
+        final LongValues ordToDoc = ordToDoc(fieldClusters.clusterMeta().ordToDoc(), postings);
         final OrdinalTranslatedKnnCollector translatedKnnCollector = new OrdinalTranslatedKnnCollector(
             knnCollector,
             (ord) -> Math.toIntExact(ordToDoc.get(ord))
@@ -290,6 +277,11 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                 return numVectors;
             }
         };
+    }
+
+    private Clusters clusters(String fieldName) {
+        FieldInfo info = fieldInfos.fieldInfo(fieldName);
+        return info == null ? null : clusters.get(info.number);
     }
 
     /**
