@@ -5,13 +5,21 @@
 
 package org.opensearch.knn.clusterann.read.orchestration;
 
+import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.AcceptDocs;
+import org.apache.lucene.search.ConjunctionUtils;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.IOSupplier;
+import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.hnsw.NeighborQueue;
 import org.opensearch.knn.clusterann.read.CentroidVectorValues;
 import org.opensearch.knn.clusterann.read.Clusters;
 
 import java.io.IOException;
+import java.util.List;
 
 /**
  * Chooses which clusters a query should visit.
@@ -30,7 +38,55 @@ public final class CentroidPlanner {
     private CentroidPlanner() {}
 
     /**
-     * Rank this field's centroids against the query and name the clusters to visit.
+     * Rank this field's centroids against the query and name the clusters to visit, considering only clusters reached
+     * by the document-space filter when one is present.
+     *
+     * <p>A filter that is null or has null {@link AcceptDocs#bits()} takes the unfiltered path without reading
+     * ordinal-to-centroid assignments. Lucene drops a filter that rewrites to match-all and hands each leaf its live
+     * docs, so a match-all filter on a segment without deletions arrives here with null bits. Any other filter takes
+     * the filtered path, even if it happens to accept every document.
+     *
+     * @param clusters the field's clusters
+     * @param query the query vector, in the space it arrived in; not modified
+     * @param params the bounds to choose within
+     * @param acceptDocs document-space filter, or null for an unfiltered search
+     * @param vectorDocsSupplier a new iterator over the documents that have this vector field, exposing each one's
+     *     vector ordinal; called only when a sparse field is filtered
+     * @return centroid ordinals to probe, ordered closest-first; empty if no non-empty cluster matches
+     */
+    public static int[] plan(
+        Clusters clusters,
+        float[] query,
+        PlanParams params,
+        AcceptDocs acceptDocs,
+        IOSupplier<KnnVectorValues.DocIndexIterator> vectorDocsSupplier
+    ) throws IOException {
+        if (clusters.numClusters() == 0) {
+            return NO_PROBES;
+        }
+        if (acceptDocs == null || acceptDocs.bits() == null) {
+            return plan(clusters, query, params);
+        }
+
+        final LongValues ordToCentroid = clusters.ordToCentroid();
+        final FixedBitSet acceptedCentroids = new FixedBitSet(clusters.numClusters());
+        final DocIdSetIterator acceptedDocs = acceptDocs.iterator();
+        if (clusters.hasDenseVectorValues()) {
+            for (int doc = acceptedDocs.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = acceptedDocs.nextDoc()) {
+                acceptedCentroids.set((int) ordToCentroid.get(doc));
+            }
+        } else {
+            final KnnVectorValues.DocIndexIterator vectorDocs = vectorDocsSupplier.get();
+            final DocIdSetIterator acceptedVectorDocs = ConjunctionUtils.intersectIterators(List.of(acceptedDocs, vectorDocs));
+            while (acceptedVectorDocs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+                acceptedCentroids.set((int) ordToCentroid.get(vectorDocs.index()));
+            }
+        }
+        return planEligible(clusters, query, params, acceptedCentroids);
+    }
+
+    /**
+     * Rank every centroid in this field against the query and name the clusters to visit.
      *
      * <p>Costs one pass over the centroid region ({@code numClusters × dimension} floats), before any posting is
      * touched. Empty clusters are dropped during the sweep so they never take up a probe slot.
@@ -42,7 +98,7 @@ public final class CentroidPlanner {
      *
      * TODO: return NeighborQueue directly if possible, waiting it out for inter-cluster pruning strategies to be added
      */
-    public static int[] plan(Clusters clusters, float[] query, PlanParams params) throws IOException {
+    static int[] plan(Clusters clusters, float[] query, PlanParams params) throws IOException {
         int numClusters = clusters.numClusters();
         if (numClusters == 0) {
             return NO_PROBES;
@@ -54,6 +110,29 @@ public final class CentroidPlanner {
 
         final NeighborQueue nearest = new NeighborQueue(params.maxProbes(), true);
         for (int ordinal = 0; ordinal < numClusters; ordinal++) {
+            if (clusters.clusterSize(ordinal) != 0) {
+                final float[] centroid = centroids.vectorValue(ordinal);
+                nearest.insertWithOverflow(ordinal, distanceKey(similarity, query, queryNormSq, centroid, centroids));
+            }
+        }
+        return closestFirst(nearest);
+    }
+
+    /** Rank only the centroids the filter reaches, using the same plain distance key as unfiltered planning. */
+    private static int[] planEligible(Clusters clusters, float[] query, PlanParams params, FixedBitSet acceptedCentroids)
+        throws IOException {
+        int numClusters = clusters.numClusters();
+        if (numClusters == 0 || acceptedCentroids.cardinality() == 0) {
+            return NO_PROBES;
+        }
+
+        final VectorSimilarityFunction similarity = clusters.clusterMeta().similarityFunction();
+        final CentroidVectorValues centroids = clusters.centroids();
+        float queryNormSq = similarity == VectorSimilarityFunction.EUCLIDEAN ? VectorUtil.dotProduct(query, query) : 0f;
+
+        final NeighborQueue nearest = new NeighborQueue(params.maxProbes(), true);
+        for (int ordinal = acceptedCentroids.nextSetBit(0); ordinal != DocIdSetIterator.NO_MORE_DOCS && ordinal < numClusters; ordinal =
+            ordinal + 1 < acceptedCentroids.length() ? acceptedCentroids.nextSetBit(ordinal + 1) : DocIdSetIterator.NO_MORE_DOCS) {
             if (clusters.clusterSize(ordinal) != 0) {
                 final float[] centroid = centroids.vectorValue(ordinal);
                 nearest.insertWithOverflow(ordinal, distanceKey(similarity, query, queryNormSq, centroid, centroids));

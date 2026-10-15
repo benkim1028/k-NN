@@ -12,9 +12,12 @@ import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.IndexableField;
+import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.SerialMergeScheduler;
+import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.KnnFloatVectorQuery;
 import org.apache.lucene.search.ScoreDoc;
@@ -22,9 +25,11 @@ import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.util.LuceneTestCase;
+import org.apache.lucene.util.FixedBitSet;
 import org.opensearch.knn.index.codec.clusterann.ClusterANN1030TestCodec;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.function.IntPredicate;
@@ -93,6 +98,29 @@ public class KNN1030ClusterANNVectorsSparseFieldTest extends LuceneTestCase {
         }
     }
 
+    public void testFilteredSearch_whenSomeDocsHaveNoVector_flushedSegment() throws Exception {
+        try (Directory dir = new ByteBuffersDirectory()) {
+            try (IndexWriter writer = new IndexWriter(dir, flushedConfig())) {
+                addDocsSkippingEveryThird(writer, 0, NUM_ROWS);
+                writer.commit();
+            }
+            assertFilteredSearchesStayInTheFilter(dir);
+        }
+    }
+
+    public void testFilteredSearch_whenSomeDocsHaveNoVector_mergedSegment() throws Exception {
+        try (Directory dir = new ByteBuffersDirectory()) {
+            try (IndexWriter writer = new IndexWriter(dir, mergedConfig())) {
+                addDocsSkippingEveryThird(writer, 0, NUM_ROWS / 2);
+                writer.commit();
+                addDocsSkippingEveryThird(writer, NUM_ROWS / 2, NUM_ROWS);
+                writer.commit();
+                writer.forceMerge(1);
+            }
+            assertFilteredSearchesStayInTheFilter(dir);
+        }
+    }
+
     private static IndexWriterConfig flushedConfig() {
         return config().setMergePolicy(NoMergePolicy.INSTANCE).setMaxBufferedDocs(2 * NUM_ROWS);
     }
@@ -143,6 +171,54 @@ public class KNN1030ClusterANNVectorsSparseFieldTest extends LuceneTestCase {
                     final IndexableField hitRow = searcher.storedFields().document(hit.doc).getField(ROW);
                     assertNotNull("query " + row + " hit doc " + hit.doc + ", which has no vector", hitRow);
                     foundSelf |= hitRow.numericValue().intValue() == row;
+                }
+                assertTrue("query " + row + " did not find its own doc in the top " + K, foundSelf);
+            }
+        }
+    }
+
+    /**
+     * Searches with a filter that accepts the second half of the rows plus every document without a vector, so the
+     * planner has to step over accepted documents the field does not carry. Every hit must be an accepted vector
+     * document, and each accepted row must still find itself.
+     */
+    private static void assertFilteredSearchesStayInTheFilter(final Directory dir) throws Exception {
+        try (DirectoryReader reader = DirectoryReader.open(dir)) {
+            assertEquals(1, reader.leaves().size());
+            final LeafReader leaf = reader.leaves().get(0).reader();
+            final StoredFields storedFields = leaf.storedFields();
+            final FixedBitSet accepted = new FixedBitSet(leaf.maxDoc());
+            final int[] docOfRow = new int[NUM_ROWS];
+            Arrays.fill(docOfRow, -1);
+            for (int doc = 0; doc < leaf.maxDoc(); doc++) {
+                final IndexableField row = storedFields.document(doc).getField(ROW);
+                if (row == null) {
+                    accepted.set(doc);
+                } else {
+                    docOfRow[row.numericValue().intValue()] = doc;
+                    if (row.numericValue().intValue() >= NUM_ROWS / 2) {
+                        accepted.set(doc);
+                    }
+                }
+            }
+            for (int row = NUM_ROWS / 2; row < NUM_ROWS; row++) {
+                if (!hasVector(row)) {
+                    continue;
+                }
+                final TopDocs hits = leaf.searchNearestVectors(
+                    FIELD,
+                    VECTORS[row],
+                    K,
+                    AcceptDocs.fromLiveDocs(accepted, leaf.maxDoc()),
+                    Integer.MAX_VALUE
+                );
+                assertTrue("query " + row + " found nothing", hits.scoreDocs.length > 0);
+                boolean foundSelf = false;
+                for (final ScoreDoc hit : hits.scoreDocs) {
+                    final IndexableField hitRow = storedFields.document(hit.doc).getField(ROW);
+                    assertNotNull("query " + row + " hit doc " + hit.doc + ", which has no vector", hitRow);
+                    assertTrue("query " + row + " hit doc " + hit.doc + ", which the filter rejects", accepted.get(hit.doc));
+                    foundSelf |= hit.doc == docOfRow[row];
                 }
                 assertTrue("query " + row + " did not find its own doc in the top " + K, foundSelf);
             }

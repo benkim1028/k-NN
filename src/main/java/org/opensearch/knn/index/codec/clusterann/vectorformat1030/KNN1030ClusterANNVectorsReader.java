@@ -9,6 +9,7 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
+import org.apache.lucene.codecs.lucene90.IndexedDISI;
 import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.CorruptIndexException;
@@ -304,14 +305,22 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
             return;
         }
 
-        final LongValues ordToDoc = ordToDoc(fieldClusters.clusterMeta().ordToDoc(), postings);
+        final OrdToDocDISIReaderConfiguration ordToDocConfig = fieldClusters.clusterMeta().ordToDoc();
+        final LongValues ordToDoc = ordToDoc(ordToDocConfig, postings);
         final OrdinalTranslatedKnnCollector translatedKnnCollector = new OrdinalTranslatedKnnCollector(
             knnCollector,
             (ord) -> Math.toIntExact(ordToDoc.get(ord))
         );
-        Bits acceptedOrds = buildAcceptedOrds(acceptDocs, ordToDoc, fieldClusters.numVectors());
+        final Bits acceptedOrds = buildAcceptedOrds(acceptDocs, ordToDoc, fieldClusters.numVectors());
 
-        int[] probes = CentroidPlanner.plan(fieldClusters, query, PlanParams.of(fieldClusters.numClusters()));
+        // Like ordToDoc, the docs-with-field set sits at absolute offsets in the whole .clap.
+        final int[] probes = CentroidPlanner.plan(
+            fieldClusters,
+            query,
+            PlanParams.of(fieldClusters.numClusters()),
+            acceptDocs,
+            () -> IndexedDISI.asDocIndexIterator(ordToDocConfig.getIndexedDISI(postings))
+        );
 
         float[] scanQuery = new float[query.length];
         fieldClusters.rotation().rotate(query, scanQuery);

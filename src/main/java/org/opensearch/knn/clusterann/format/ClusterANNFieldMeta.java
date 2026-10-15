@@ -435,8 +435,9 @@ public final class ClusterANNFieldMeta {
     }
 
     /**
-     * A cluster needs at least one vector, so {@code centroidCount} can never exceed {@code vectorCount}.
-     * Checking that here also bounds the three arrays sized by it.
+     * A non-empty field needs at least one cluster, and every cluster needs at least one vector, so
+     * {@code centroidCount} is in {@code [1, vectorCount]}. An empty field has zero of both. Checking that here also
+     * bounds the three arrays sized by the centroid count.
      */
     private static void checkShape(ChecksumIndexInput meta, int dimension, int vectorCount, int centroidCount) throws IOException {
         if (dimension <= 0) {
@@ -445,8 +446,12 @@ public final class ClusterANNFieldMeta {
         if (vectorCount < 0) {
             throw new CorruptIndexException("Negative vectorCount: " + vectorCount, meta);
         }
-        if (centroidCount < 0 || centroidCount > vectorCount) {
-            throw new CorruptIndexException("centroidCount must be in [0, " + vectorCount + "], got: " + centroidCount, meta);
+        final int minCentroidCount = vectorCount == 0 ? 0 : 1;
+        if (centroidCount < minCentroidCount || centroidCount > vectorCount) {
+            throw new CorruptIndexException(
+                "centroidCount must be in [" + minCentroidCount + ", " + vectorCount + "], got: " + centroidCount,
+                meta
+            );
         }
     }
 

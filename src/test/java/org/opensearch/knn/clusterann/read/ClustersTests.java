@@ -11,8 +11,10 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.RandomAccessInput;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.LongValues;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -22,12 +24,20 @@ import org.mockito.InOrder;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
 import org.opensearch.knn.clusterann.read.block.scalar.JavaAdcScoreComputer;
 import org.opensearch.knn.clusterann.format.ClusterANNFormatConstants;
+import org.opensearch.knn.clusterann.format.rotation.RotationFormats;
 import org.opensearch.knn.clusterann.read.orchestration.ClusterScan;
 import org.opensearch.knn.clusterann.read.orchestration.ScanContext;
+import org.opensearch.knn.clusterann.write.CentroidsWriter;
+import org.opensearch.knn.clusterann.write.CentroidsWriter.CentroidData;
+import org.opensearch.knn.clusterann.write.CentroidsWriter.CentroidOffsets;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
@@ -133,7 +143,7 @@ class ClustersTests {
         }
 
         // then
-        assertEquals(0, centroidsInput.reads(), "a cluster that is never scanned must not read its centroid");
+        assertEquals(0, centroidsInput.bytesRead(), "a cluster that is never scanned must not read its centroid");
     }
 
     @Test
@@ -161,6 +171,89 @@ class ClustersTests {
         // then — the region is only read when a cluster is scanned, so what is asserted here is that it was locatable
         assertEquals(CENTROID_COUNT, clusters.numClusters());
         assertTrue(clusters.get(0).size() > 0);
+    }
+
+    @Test
+    void testOrdToCentroid_thenReturnsPrimaryAssignmentsFromRegion1() throws IOException {
+        int[] ordToCentroid = { 0, 1, 2, 1, 0, 2, 2, 1, 0, 2, 1, 0, 0, 1, 2, 2, 1, 0, 1 };
+
+        LongValues assignments = clustersWithAssignments(ordToCentroid).ordToCentroid();
+
+        for (int ordinal = 0; ordinal < ordToCentroid.length; ordinal++) {
+            assertEquals(ordToCentroid[ordinal], assignments.get(ordinal), "ordinal " + ordinal);
+        }
+    }
+
+    @Test
+    void testOrdToCentroid_thenDoesNotReadAssignmentsUntilLookup() throws IOException {
+        int[] ordToCentroid = { 0, 1, 2, 1, 0, 2, 2, 1, 0, 2, 1, 0, 0, 1, 2, 2, 1, 0, 1 };
+        ClacFixture fixture = clacWithAssignments(ordToCentroid);
+        CountingInput input = new CountingInput(fixture.input(), new int[1]);
+        Clusters clusters = clusters(
+            VectorSimilarityFunction.EUCLIDEAN,
+            input,
+            fieldMeta(VectorSimilarityFunction.EUCLIDEAN, ordToCentroid.length, fixture.length(), fixture.offsets().clacCentroidsOffset())
+        );
+        assertEquals(0, input.bytesRead(), "constructing Clusters must not read region 1");
+
+        LongValues assignments = clusters.ordToCentroid();
+
+        assertEquals(0, input.bytesRead(), "building the accessor must not read region 1");
+        assertEquals(ordToCentroid[7], assignments.get(7));
+        assertEquals(Integer.BYTES, input.bytesRead(), "one lookup must read only its own assignment");
+    }
+
+    @Test
+    void testOrdToCentroid_thenCreatesQueryPrivateRandomAccessLookup() throws IOException {
+        int[] ordToCentroid = { 0, 1, 2, 1, 0, 2, 2, 1, 0, 2, 1, 0, 0, 1, 2, 2, 1, 0, 1 };
+        ClacFixture fixture = clacWithAssignments(ordToCentroid);
+        CountingInput input = new CountingInput(fixture.input(), new int[1]);
+        Clusters clusters = clusters(
+            VectorSimilarityFunction.EUCLIDEAN,
+            input,
+            fieldMeta(VectorSimilarityFunction.EUCLIDEAN, ordToCentroid.length, fixture.length(), fixture.offsets().clacCentroidsOffset())
+        );
+        input.resetRandomAccessSlices();
+
+        LongValues first = clusters.ordToCentroid();
+        LongValues second = clusters.ordToCentroid();
+
+        assertEquals(2, input.randomAccessSlices(), "each query must get its own random-access slice");
+        assertNotSame(first, second);
+    }
+
+    @Test
+    void testOrdToCentroid_whenUsedConcurrently_thenReturnsPrimaryAssignments() throws Exception {
+        int[] ordToCentroid = { 0, 1, 2, 1, 0, 2, 2, 1, 0, 2, 1, 0, 0, 1, 2, 2, 1, 0, 1 };
+        Clusters clusters = clustersWithAssignments(ordToCentroid);
+        LongValues forwardAssignments = clusters.ordToCentroid();
+        LongValues backwardAssignments = clusters.ordToCentroid();
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+
+        try {
+            Future<?> forward = executor.submit(() -> {
+                start.await();
+                for (int ordinal = 0; ordinal < ordToCentroid.length; ordinal++) {
+                    assertEquals(ordToCentroid[ordinal], forwardAssignments.get(ordinal), "forward ordinal " + ordinal);
+                }
+                return null;
+            });
+            Future<?> backward = executor.submit(() -> {
+                start.await();
+                for (int ordinal = ordToCentroid.length - 1; ordinal >= 0; ordinal--) {
+                    assertEquals(ordToCentroid[ordinal], backwardAssignments.get(ordinal), "backward ordinal " + ordinal);
+                }
+                return null;
+            });
+
+            start.countDown();
+
+            forward.get();
+            backward.get();
+        } finally {
+            executor.shutdownNow();
+        }
     }
 
     // ---------------------------------------------------------------- scan
@@ -251,19 +344,56 @@ class ClustersTests {
     // ---------------------------------------------------------------- helpers
 
     private Clusters clusters(VectorSimilarityFunction similarity) throws IOException {
-        return clusters(similarity, open("clac", 4096));
+        return clusters(similarity, open("clac", 4096), fieldMeta(similarity));
     }
 
     private Clusters clusters(VectorSimilarityFunction similarity, IndexInput centroids) throws IOException {
+        return clusters(similarity, centroids, fieldMeta(similarity));
+    }
+
+    private Clusters clusters(VectorSimilarityFunction similarity, IndexInput centroids, ClusterANNFieldMeta fieldMeta) throws IOException {
         // The inputs are the field's own regions, cut at clapOffset and clacOffset, as the reader hands them over.
-        return new Clusters(open("clap", 3000), centroids, null, fieldMeta(similarity), JavaAdcScoreComputer.INSTANCE);
+        return new Clusters(open("clap", 3000), centroids, null, fieldMeta, JavaAdcScoreComputer.INSTANCE);
+    }
+
+    private Clusters clustersWithAssignments(int[] ordToCentroid) throws IOException {
+        ClacFixture fixture = clacWithAssignments(ordToCentroid);
+        return clusters(
+            VectorSimilarityFunction.EUCLIDEAN,
+            fixture.input(),
+            fieldMeta(VectorSimilarityFunction.EUCLIDEAN, ordToCentroid.length, fixture.length(), fixture.offsets().clacCentroidsOffset())
+        );
+    }
+
+    private ClacFixture clacWithAssignments(int[] ordToCentroid) throws IOException {
+        Directory directory = new ByteBuffersDirectory();
+        directories.add(directory);
+        CentroidOffsets offsets;
+        try (IndexOutput out = directory.createOutput("clac", IOContext.DEFAULT)) {
+            offsets = CentroidsWriter.write(
+                out,
+                new CentroidData(ordToCentroid, new float[CENTROID_COUNT][DIMENSION]),
+                RotationFormats.create(ClusterANNFormatConstants.ROTATION_NONE, DIMENSION)
+            );
+        }
+        IndexInput input = directory.openInput("clac", IOContext.DEFAULT);
+        return new ClacFixture(input, input.length(), offsets);
     }
 
     private static ClusterANNFieldMeta fieldMeta(VectorSimilarityFunction similarity) throws IOException {
+        return fieldMeta(similarity, VECTOR_COUNT, 4096L, 64L);
+    }
+
+    private static ClusterANNFieldMeta fieldMeta(
+        VectorSimilarityFunction similarity,
+        int vectorCount,
+        long clacLength,
+        long clacCentroidsOffset
+    ) throws IOException {
         return new ClusterANNFieldMeta(
             BLOCK_SIZE,
             DIMENSION,
-            VECTOR_COUNT,
+            vectorCount,
             CENTROID_COUNT,
             similarity,
             1,                                      // docBits, one bit per dimension
@@ -271,8 +401,8 @@ class ClustersTests {
             ClusterANNFormatConstants.QUANTIZER_OPTIMIZED_SQ,
             new byte[0],
             0L,                                     // clacOffset
-            4096L,                                  // clacLength
-            64L,                                    // clacCentroidsOffset
+            clacLength,
+            clacCentroidsOffset,
             -1L,        // clacRotatedCentroidsOffset
             CLAP_OFFSET,
             3000L,                                  // clapLength
@@ -282,7 +412,7 @@ class ClustersTests {
             -1L,         // clarLength
             -1L,
             // Dense: the fields under test have a vector per document, so the ordinal is the document id.
-            ClusterANNFieldMetaEncoder.denseOrdToDoc(VECTOR_COUNT)
+            ClusterANNFieldMetaEncoder.denseOrdToDoc(vectorCount)
         );
     }
 
@@ -299,36 +429,95 @@ class ClustersTests {
         return new CountingInput(open(name, bytes), new int[1]);
     }
 
-    /** Counts reads, so "get() reads nothing" is asserted rather than assumed. Clones share the counter. */
+    private record ClacFixture(IndexInput input, long length, CentroidOffsets offsets) {
+    }
+
+    /** Counts bytes read, so lazy access is asserted rather than assumed. Clones and slices share the counter. */
     private static final class CountingInput extends org.apache.lucene.store.FilterIndexInput {
 
-        private final int[] reads;
+        private final int[] bytesRead;
+        private final int[] randomAccessSlices;
 
-        private CountingInput(IndexInput in, int[] reads) {
-            super("counting(" + in + ")", in);
-            this.reads = reads;
+        private CountingInput(IndexInput in, int[] bytesRead) {
+            this(in, bytesRead, new int[1]);
         }
 
-        private int reads() {
-            return reads[0];
+        private CountingInput(IndexInput in, int[] bytesRead, int[] randomAccessSlices) {
+            super("counting(" + in + ")", in);
+            this.bytesRead = bytesRead;
+            this.randomAccessSlices = randomAccessSlices;
+        }
+
+        private int bytesRead() {
+            return bytesRead[0];
+        }
+
+        private int randomAccessSlices() {
+            return randomAccessSlices[0];
+        }
+
+        private void resetRandomAccessSlices() {
+            randomAccessSlices[0] = 0;
         }
 
         @Override
         public byte readByte() throws IOException {
-            reads[0]++;
+            bytesRead[0]++;
             return in.readByte();
         }
 
         @Override
         public void readBytes(byte[] bytes, int offset, int length) throws IOException {
-            reads[0]++;
+            bytesRead[0] += length;
             in.readBytes(bytes, offset, length);
         }
 
         @Override
+        public int readInt() throws IOException {
+            bytesRead[0] += Integer.BYTES;
+            return in.readInt();
+        }
+
+        @Override
         public void readFloats(float[] floats, int offset, int length) throws IOException {
-            reads[0]++;
+            bytesRead[0] += length * Float.BYTES;
             in.readFloats(floats, offset, length);
+        }
+
+        @Override
+        public RandomAccessInput randomAccessSlice(long offset, long length) throws IOException {
+            randomAccessSlices[0]++;
+            RandomAccessInput slice = in.randomAccessSlice(offset, length);
+            return new RandomAccessInput() {
+                @Override
+                public long length() {
+                    return slice.length();
+                }
+
+                @Override
+                public byte readByte(long position) throws IOException {
+                    bytesRead[0]++;
+                    return slice.readByte(position);
+                }
+
+                @Override
+                public short readShort(long position) throws IOException {
+                    bytesRead[0] += Short.BYTES;
+                    return slice.readShort(position);
+                }
+
+                @Override
+                public int readInt(long position) throws IOException {
+                    bytesRead[0] += Integer.BYTES;
+                    return slice.readInt(position);
+                }
+
+                @Override
+                public long readLong(long position) throws IOException {
+                    bytesRead[0] += Long.BYTES;
+                    return slice.readLong(position);
+                }
+            };
         }
 
         /**
@@ -339,12 +528,12 @@ class ClustersTests {
          */
         @Override
         public IndexInput slice(String sliceDescription, long offset, long length) throws IOException {
-            return new CountingInput(in.slice(sliceDescription, offset, length), reads);
+            return new CountingInput(in.slice(sliceDescription, offset, length), bytesRead, randomAccessSlices);
         }
 
         @Override
         public CountingInput clone() {
-            return new CountingInput(in.clone(), reads);
+            return new CountingInput(in.clone(), bytesRead, randomAccessSlices);
         }
     }
 }
