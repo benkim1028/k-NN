@@ -17,6 +17,7 @@ import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.hnsw.NeighborQueue;
 import org.opensearch.knn.clusterann.read.CentroidVectorValues;
 import org.opensearch.knn.clusterann.read.Clusters;
+import org.opensearch.knn.plugin.stats.ClusterANNQueryValue;
 
 import java.io.IOException;
 import java.util.Arrays;
@@ -96,6 +97,8 @@ public final class CentroidPlanner {
             }
         }
         final int eligibleClusters = acceptedCentroids.cardinality();
+        ClusterANNQueryValue.FILTERED_SEGMENT_SCANS.increment();
+        ClusterANNQueryValue.ELIGIBLE_CLUSTERS.incrementBy(eligibleClusters);
         if (eligibleClusters == 0) {
             return NO_PROBES;
         }

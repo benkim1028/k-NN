@@ -29,6 +29,7 @@ import org.opensearch.knn.clusterann.read.block.scalar.JavaAdcScoreComputer;
 import org.opensearch.knn.clusterann.write.CentroidsWriter;
 import org.opensearch.knn.clusterann.write.CentroidsWriter.CentroidData;
 import org.opensearch.knn.clusterann.write.CentroidsWriter.CentroidOffsets;
+import org.opensearch.knn.plugin.stats.ClusterANNQueryValue;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -399,6 +400,66 @@ class CentroidPlannerFilteringTest {
             DENSE_FIELD
         );
         assertArrayEquals(IntStream.range(0, 129).toArray(), fewerProbes);
+    }
+
+    @Test
+    void testPlanWithFilter_whenUnfiltered_thenCountsNoFilteredScan() throws IOException {
+        resetStats();
+        float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 3f, 0f } };
+        Clusters clusters = clusters(centroids);
+        PlanParams params = new PlanParams(1, centroids.length);
+
+        CentroidPlanner.plan(clusters, new float[DIMENSION], params, K, null, DENSE_FIELD);
+        CentroidPlanner.plan(clusters, new float[DIMENSION], params, K, AcceptDocs.fromLiveDocs(null, 12), DENSE_FIELD);
+
+        assertEquals(0L, ClusterANNQueryValue.FILTERED_SEGMENT_SCANS.getValue());
+        assertEquals(0L, ClusterANNQueryValue.ELIGIBLE_CLUSTERS.getValue());
+    }
+
+    @Test
+    void testPlanFiltered_whenEligibleClustersExceedTheProbes_thenCountsEveryEligibleCluster() throws IOException {
+        resetStats();
+        float[][] centroids = new float[129][DIMENSION];
+        int[] clusterSizes = new int[centroids.length];
+        for (int ordinal = 0; ordinal < centroids.length; ordinal++) {
+            centroids[ordinal][0] = ordinal + 1;
+            clusterSizes[ordinal] = 1;
+        }
+        FixedBitSet acceptedOrds = new FixedBitSet(centroids.length);
+        acceptedOrds.set(0, centroids.length - 1);
+
+        int[] probes = CentroidPlanner.plan(
+            clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, clusterSizes),
+            new float[DIMENSION],
+            PlanParams.of(centroids.length),
+            K,
+            acceptDocs(acceptedOrds),
+            DENSE_FIELD
+        );
+
+        assertEquals(34, probes.length);
+        assertEquals(1L, ClusterANNQueryValue.FILTERED_SEGMENT_SCANS.getValue());
+        assertEquals(128L, ClusterANNQueryValue.ELIGIBLE_CLUSTERS.getValue());
+    }
+
+    @Test
+    void testPlanFiltered_whenNoClusterMatches_thenCountsTheScanWithNoEligibleCluster() throws IOException {
+        resetStats();
+        float[][] centroids = { { 1f, 0f }, { 2f, 0f }, { 3f, 0f } };
+        FixedBitSet acceptedOrds = new FixedBitSet(Arrays.stream(CLUSTER_SIZES).sum());
+
+        int[] probes = CentroidPlanner.plan(
+            clusters(centroids),
+            new float[DIMENSION],
+            new PlanParams(1, centroids.length),
+            K,
+            acceptDocs(acceptedOrds),
+            DENSE_FIELD
+        );
+
+        assertEquals(0, probes.length);
+        assertEquals(1L, ClusterANNQueryValue.FILTERED_SEGMENT_SCANS.getValue());
+        assertEquals(0L, ClusterANNQueryValue.ELIGIBLE_CLUSTERS.getValue());
     }
 
     @Test
@@ -780,5 +841,11 @@ class CentroidPlannerFilteringTest {
     }
 
     private record SparseField(Clusters clusters, IOSupplier<KnnVectorValues.DocIndexIterator> vectorDocs) {
+    }
+
+    private static void resetStats() {
+        for (ClusterANNQueryValue value : ClusterANNQueryValue.values()) {
+            value.set(0);
+        }
     }
 }

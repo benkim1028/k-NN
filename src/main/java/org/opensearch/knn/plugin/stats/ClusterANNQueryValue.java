@@ -30,6 +30,18 @@ public enum ClusterANNQueryValue {
     CLUSTERS_SCANNED("clusters_scanned"),
 
     /**
+     * Segment scans that took the filtered planning path: a filter with non-null bits. The denominator for
+     * {@link #ELIGIBLE_CLUSTERS}; counted even when no cluster holds an accepted vector.
+     */
+    FILTERED_SEGMENT_SCANS("filtered_segment_scans"),
+
+    /**
+     * Clusters holding at least one accepted vector (by primary assignment), before the probe ceiling is applied:
+     * how much of the index a filter left eligible.
+     */
+    ELIGIBLE_CLUSTERS("eligible_clusters"),
+
+    /**
      * Distances computed. Not the hits returned: a posting is scored and may still lose to the threshold, so this
      * is the CPU the scan spent, where the collector's visited count is what survived.
      */
