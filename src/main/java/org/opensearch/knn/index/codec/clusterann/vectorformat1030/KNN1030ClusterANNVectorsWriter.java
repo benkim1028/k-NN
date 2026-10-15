@@ -28,6 +28,7 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.TaskExecutor;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.VectorUtil;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
 import org.opensearch.knn.clusterann.format.QuantizationParams;
 import org.opensearch.knn.clusterann.write.CentroidsWriter;
@@ -173,6 +174,11 @@ public class KNN1030ClusterANNVectorsWriter extends KnnVectorsWriter {
         ensureSingleVectorField(fields.size());
         rawFlatVectorsWriter.flush(maxDoc, docMap);
         for (final FieldEntry field : fields) {
+            // The raw vectors are already on disk, so a cosine field's buffer can be normalized in place for
+            // clustering and quantization, which need unit vectors.
+            if (isCosine(field.fieldInfo)) {
+                normalizeInPlace(field.flat.getVectors());
+            }
             final FieldVectors source = source(field, docMap);
             writeField(field.fieldInfo, source.vectors, source.docsWithField, maxDoc, null); // flush clusters inline
         }
@@ -202,10 +208,13 @@ public class KNN1030ClusterANNVectorsWriter extends KnnVectorsWriter {
         ensureFlatReaderOpen();
 
         final FloatVectorValues vectors = flatReader.getFloatVectorValues(fieldInfo.name);
+        // The reopened vectors are the flat file's, so a cosine field reads them through a normalizing view
+        // rather than normalizing them in place.
+        final FloatVectorValues prepared = isCosine(fieldInfo) ? new NormalizedFloatVectorValues(vectors) : vectors;
         // Merge is the heavy path — cluster in parallel on the merge's executor (flush clusters inline).
         writeField(
             fieldInfo,
-            vectors,
+            prepared,
             docsWithField(vectors),
             mergeState.segmentInfo.maxDoc(),
             new TaskExecutor(mergeState.intraMergeTaskExecutor)
@@ -431,6 +440,16 @@ public class KNN1030ClusterANNVectorsWriter extends KnnVectorsWriter {
     private CentroidOffsets writeCentroids(final ClusteringResult clusters, final Rotation rotation) throws IOException {
         final CentroidData centroidData = new CentroidData(clusters.assignments(), clusters.centroids());
         return CentroidsWriter.write(clac, centroidData, rotation);
+    }
+
+    private static boolean isCosine(final FieldInfo fieldInfo) {
+        return fieldInfo.getVectorSimilarityFunction() == VectorSimilarityFunction.COSINE;
+    }
+
+    private static void normalizeInPlace(final List<float[]> vectors) {
+        for (final float[] vector : vectors) {
+            VectorUtil.l2normalize(vector, false); // a zero vector stays zero rather than failing the flush
+        }
     }
 
     /** A rotated field's {@code .clar} region: absolute offset and byte length. Absent for an unrotated field. */
