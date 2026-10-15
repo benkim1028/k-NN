@@ -71,6 +71,7 @@ rewrite_fmt_to_knn() {
     s/\borg\.opensearch\.knn\.vectorformats\.codec\b/org.opensearch.knn.index.codec.clusterann/g;
     $_ = "" if /^import edu\.umd\.cs\.findbugs\.annotations\.SuppressFBWarnings;$/;
     s/^import org\.apache\.lucene\.codecs\.lucene103\.Lucene103ScalarQuantizedVectorsFormat(\.ScalarEncoding)?;$/import org.opensearch.knn.clusterann.read.block.scalar.ScalarEncoding;/;
+    s/^import static org\.apache\.lucene\.codecs\.lucene103\.Lucene103ScalarQuantizedVectorsFormat\.ScalarEncoding\./import static org.opensearch.knn.clusterann.read.block.scalar.ScalarEncoding./;
     s/\bLucene103ScalarQuantizedVectorsFormat\.ScalarEncoding\b/ScalarEncoding/g;
     s/\bOptimizedScalarQuantizer\.transposeDibit\b/Lucene104Backports.transposeDibit/g;
     s/\bVectorUtil\.int4DotProductSinglePacked\b/Lucene104Backports.int4DotProductSinglePacked/g;
