@@ -13,7 +13,8 @@ package org.opensearch.knn.clusterann.read.orchestration;
  * the caller supplies a range and the planner decides within it.
  *
  * <p>{@code maxProbes} is applied during the ranking sweep, as the capacity of the selection heap, so the clusters
- * beyond it are never ordered. {@code minProbes} is applied afterwards, as a floor on whatever the pruners left.
+ * beyond it are never ordered. {@code minProbes} is applied afterwards: the knee pruner keeps that many outright and
+ * looks for its cut only past them.
  *
  * @param minProbes fewest clusters a plan may name, unless the field has fewer non-empty clusters than this
  * @param maxProbes most clusters a plan may name; also the ranking sweep's heap capacity

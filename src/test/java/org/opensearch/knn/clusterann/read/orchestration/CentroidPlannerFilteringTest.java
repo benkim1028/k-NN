@@ -56,6 +56,10 @@ class CentroidPlannerFilteringTest {
     private static final int WIDE_CLUSTERS = 400;
     private static final int WIDE_CLUSTER_SIZE = 25;
     private static final int WIDE_VECTORS = WIDE_CLUSTERS * WIDE_CLUSTER_SIZE;
+    /** Root 11, so a floor of 11 and an unfiltered ceiling of 33, with room past the floor for a knee to land. */
+    private static final int KNEE_CENTROIDS = 129;
+    /** One accepted vector per cluster of this size is a selectivity of 2%. */
+    private static final int SELECTIVE_CLUSTER_SIZE = 50;
     private static final IOSupplier<KnnVectorValues.DocIndexIterator> DENSE_FIELD = () -> {
         throw new AssertionError("a dense field maps documents to ordinals directly and must not read its vector docs");
     };
@@ -268,7 +272,10 @@ class CentroidPlannerFilteringTest {
         assertArrayEquals(IntStream.range(0, centroids.length - 1).toArray(), filtered);
     }
 
-    /** Filtered plans are not knee-pruned, so a cluster past the knee survives. The curve above has no knee. */
+    /**
+     * The exact route is not knee-pruned, so a cluster past the knee survives: the even curve above, with its last
+     * eligible centroid moved out to a cliff.
+     */
     @Test
     void testPlanFiltered_whenTheCurveHasAKnee_thenStillPlansEveryEligibleCentroid() throws IOException {
         float[][] centroids = new float[129][DIMENSION];
@@ -292,6 +299,118 @@ class CentroidPlannerFilteringTest {
         );
 
         assertArrayEquals(IntStream.range(0, centroids.length - 1).toArray(), filtered);
+    }
+
+    /**
+     * The eligible ranking is cut at its knee like an unfiltered one. s = 128/129, so the budget is 34 and the floor 11.
+     * The tail from rank 10 rises from 1.1^2 to 133^2, about 17688 over 23 gaps, and bars at 2307. The gap from rank 14
+     * to rank 15 (115^2 - 1.14^2, about 13224) clears it; the gaps after it (2x + 1, at most 265) do not.
+     */
+    @Test
+    void testPlanFiltered_whenTheEligibleCurveBreaksAboveTheFloor_thenCutsAtTheKnee() throws IOException {
+        FixedBitSet acceptedOrds = new FixedBitSet(KNEE_CENTROIDS);
+        acceptedOrds.set(0, KNEE_CENTROIDS - 1);
+
+        int[] probes = planKneeField(1, acceptedOrds, K);
+
+        assertArrayEquals(IntStream.range(0, 15).toArray(), probes);
+    }
+
+    /**
+     * A break inside the floor is not a knee on the filtered path either: the floor is planned outright and the tail
+     * past it decides. Break between ranks 4 and 5, floor 11: the tail from rank 10 rises 133^2 - 110^2 = 5589 over 23 gaps,
+     * bar 729, and no tail gap (at most 265) clears it, so the whole budget of 34 stays.
+     */
+    @Test
+    void testPlanFiltered_whenTheEligibleCurveBreaksInsideTheFloor_thenPlansTheWholeBudget() throws IOException {
+        FixedBitSet acceptedOrds = new FixedBitSet(KNEE_CENTROIDS);
+        acceptedOrds.set(0, KNEE_CENTROIDS - 1);
+
+        int[] probes = CentroidPlanner.plan(
+            kneeField(5, 1),
+            new float[DIMENSION],
+            PlanParams.of(KNEE_CENTROIDS),
+            K,
+            acceptDocs(acceptedOrds),
+            DENSE_FIELD
+        );
+
+        assertArrayEquals(IntStream.range(0, 34).toArray(), probes);
+    }
+
+    /**
+     * Selectivity does not gate the cut: a plan under a quarter is cut like any other. One vector of four accepted in
+     * all but the last cluster: s = 128/516, just under 0.25, budget ceil(4.183 * 11) = ceil(46.01) = 47, floor 11.
+     * The tail rises 146^2 - 1.1^2, about 21315, over 36 gaps and bars at 1776; the gap from rank 14 to rank 15 clears
+     * it, so the 47 are cut to 15.
+     */
+    @Test
+    void testPlanFiltered_whenSelectivityIsUnderAQuarter_thenStillCutsAtTheKnee() throws IOException {
+        int[] probes = planKneeField(4, firstVectorOfEachCluster(KNEE_CENTROIDS - 1, 4), K);
+
+        assertArrayEquals(IntStream.range(0, 15).toArray(), probes);
+    }
+
+    /**
+     * A selective filter raises the budget well past the knee, and the cut still lands there. One vector of
+     * {@link #SELECTIVE_CLUSTER_SIZE} accepted in every cluster: s = 129/6450 = 0.02, budget ceil(8.368 * 11) =
+     * ceil(92.05) = 93, floor 11. The tail rises 192^2 - 1.1^2, about 36863, over 82 gaps and bars at 1349; the gap
+     * from rank 14 to rank 15 clears it, so the 93 are cut to 15, which hold 15 accepted vectors, enough for k = 1.
+     */
+    @Test
+    void testPlanFiltered_whenSelectivityIsLow_thenCutsAtTheKnee() throws IOException {
+        FixedBitSet acceptedOrds = firstVectorOfEachCluster(KNEE_CENTROIDS, SELECTIVE_CLUSTER_SIZE);
+
+        int[] probes = planKneeField(SELECTIVE_CLUSTER_SIZE, acceptedOrds, K);
+
+        assertArrayEquals(IntStream.range(0, 15).toArray(), probes);
+    }
+
+    /**
+     * At low selectivity the cut is still extended to hold k accepted vectors. The same 2% filter and knee at 15, but
+     * k = 20: the 15 clusters before the knee hold one accepted vector each, so five more are planned, 20 in all, still
+     * far short of the budget of 93.
+     */
+    @Test
+    void testPlanFiltered_whenSelectivityIsLowAndTheKneeKeepsFewerThanK_thenExtendsTheCutToHoldK() throws IOException {
+        FixedBitSet acceptedOrds = firstVectorOfEachCluster(KNEE_CENTROIDS, SELECTIVE_CLUSTER_SIZE);
+        int k = 20;
+
+        int[] probes = planKneeField(SELECTIVE_CLUSTER_SIZE, acceptedOrds, k);
+
+        assertArrayEquals(IntStream.range(0, k).toArray(), probes);
+    }
+
+    /**
+     * The knee reads distances only, so a filter that thins out near the query could leave the cut holding fewer than
+     * k accepted vectors. The cut is extended until it holds k. Clusters of four: the 15 before the knee hold one
+     * accepted vector each, every later one all four, so s = 471/516 and the budget is 34. The knee keeps 15 clusters
+     * holding 15 accepted vectors; k = 20 needs two more clusters, 23 accepted, so 17 are planned.
+     */
+    @Test
+    void testPlanFiltered_whenTheKneeKeepsFewerThanKAcceptedVectors_thenExtendsTheCutToHoldK() throws IOException {
+        int[] probes = planKneeField(4, thinNearTheQuery(), 20);
+
+        assertArrayEquals(IntStream.range(0, 17).toArray(), probes);
+    }
+
+    /** The extension stops at the budget: the 34 ranked hold 15 + 19 x 4 = 91 accepted, short of k = 200. */
+    @Test
+    void testPlanFiltered_whenEvenTheBudgetHoldsFewerThanKAcceptedVectors_thenPlansTheWholeBudget() throws IOException {
+        int[] probes = planKneeField(4, thinNearTheQuery(), 200);
+
+        assertArrayEquals(IntStream.range(0, 34).toArray(), probes);
+    }
+
+    /** A k that covers every accepted vector takes the exact route, which is never cut, knee or not. */
+    @Test
+    void testPlanFiltered_whenKCoversEveryAcceptedVectorOnAKneeCurve_thenPlansEveryEligibleCentroid() throws IOException {
+        FixedBitSet acceptedOrds = new FixedBitSet(KNEE_CENTROIDS);
+        acceptedOrds.set(0, KNEE_CENTROIDS - 1);
+
+        int[] probes = planKneeField(1, acceptedOrds, KNEE_CENTROIDS - 1);
+
+        assertArrayEquals(IntStream.range(0, KNEE_CENTROIDS - 1).toArray(), probes);
     }
 
     @Test
@@ -628,6 +747,49 @@ class CentroidPlannerFilteringTest {
         assertArrayEquals(new int[] { 0 }, probes);
         verify(clusters).ordToCentroid();
         verify(clusters, never()).get(anyInt());
+    }
+
+    /**
+     * {@link #KNEE_CENTROIDS} centroids on a line, each cluster holding {@code clusterSize} vectors. The first
+     * {@code near} sit 0.01 apart from 1 on, and centroid {@code c} past them at {@code 100 + c}, so from a query at
+     * the origin the curve breaks once, between ranks {@code near - 1} and {@code near}, and climbs evenly after it.
+     */
+    private Clusters kneeField(final int near, final int clusterSize) throws IOException {
+        float[][] centroids = new float[KNEE_CENTROIDS][DIMENSION];
+        int[] clusterSizes = new int[KNEE_CENTROIDS];
+        for (int ordinal = 0; ordinal < KNEE_CENTROIDS; ordinal++) {
+            centroids[ordinal][0] = ordinal < near ? 1f + ordinal * 0.01f : 100f + ordinal;
+            clusterSizes[ordinal] = clusterSize;
+        }
+        return clusters(VectorSimilarityFunction.EUCLIDEAN, centroids, clusterSizes);
+    }
+
+    /** Plans a query at the origin over a {@link #kneeField} that breaks between ranks 14 and 15. */
+    private int[] planKneeField(final int clusterSize, final FixedBitSet acceptedOrds, final int k) throws IOException {
+        return CentroidPlanner.plan(
+            kneeField(15, clusterSize),
+            new float[DIMENSION],
+            PlanParams.of(KNEE_CENTROIDS),
+            k,
+            acceptDocs(acceptedOrds),
+            DENSE_FIELD
+        );
+    }
+
+    /** Accepts the first vector of each of the first {@code clusters} clusters of {@code clusterSize}. */
+    private static FixedBitSet firstVectorOfEachCluster(final int clusters, final int clusterSize) {
+        FixedBitSet acceptedOrds = new FixedBitSet(KNEE_CENTROIDS * clusterSize);
+        for (int cluster = 0; cluster < clusters; cluster++) {
+            acceptedOrds.set(cluster * clusterSize);
+        }
+        return acceptedOrds;
+    }
+
+    /** Over a {@link #kneeField} of four per cluster: one accepted in each of the 15 nearest clusters, all four past. */
+    private static FixedBitSet thinNearTheQuery() {
+        FixedBitSet acceptedOrds = firstVectorOfEachCluster(15, 4);
+        acceptedOrds.set(15 * 4, KNEE_CENTROIDS * 4);
+        return acceptedOrds;
     }
 
     /** {@link #WIDE_CLUSTERS} clusters of {@link #WIDE_CLUSTER_SIZE}; centroid {@code c} sits at {@code (c + 1, 0)}. */

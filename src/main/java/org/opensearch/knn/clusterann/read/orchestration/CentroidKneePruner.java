@@ -20,13 +20,20 @@ final class CentroidKneePruner {
     private CentroidKneePruner() {}
 
     /**
-     * How many of the ranked clusters to keep, counted from the closest. Returns {@code distances.length} when there
-     * is no knee to find: a flat curve, a floor already covering everything ranked, or no gap standing out. Needs
-     * more than {@link #KNEE_FACTOR} gaps to work with, which {@link PlanParams#MIN_NPROBE} guarantees.
+     * How many of the ranked clusters to keep, counted from the closest. Every plan keeps the floor, and the knee is
+     * looked for only in the tail past it: the gaps from rank {@code minProbes - 1} on, each tested against
+     * {@link #KNEE_FACTOR} times the tail's own mean gap. The first gap over that keeps everything before it, so a cut
+     * lands anywhere from the floor to the budget. Returns {@code distances.length} when there is no knee to find: a
+     * flat tail, a floor already covering everything ranked, or no gap standing out.
+     *
+     * <p>The head is left out of both the search and the mean. A break inside the floor costs nothing to step over,
+     * since the floor pays for those clusters anyway, and the head is steep, so the whole curve's mean would sit above
+     * every tail gap and nothing past the floor could ever cut. A tail of {@link #KNEE_FACTOR} gaps or fewer cannot cut
+     * at all: no one gap exceeds the whole rise.
      *
      * @param distances ranking keys, ascending. A true squared distance only under EUCLIDEAN; elsewhere a negated
      *     similarity, still monotone in cluster quality, which is all the cut relies on
-     * @param minProbes the floor the cut may not go below
+     * @param minProbes the floor the cut may not go below; at least 1, as {@link PlanParams} guarantees
      */
     static int prune(final float[] distances, final int minProbes) {
         final int ranked = distances.length;
@@ -34,19 +41,19 @@ final class CentroidKneePruner {
             return ranked;
         }
 
-        final float rise = distances[ranked - 1] - distances[0];
+        final int first = minProbes - 1;
+        final float rise = distances[ranked - 1] - distances[first];
         if (rise <= 0) {
-            // Equidistant centroids: nothing can stand out against a mean of zero, and dividing by it is not finite.
+            // An equidistant tail: nothing can stand out against a mean of zero, and dividing by it is not finite.
             return ranked;
         }
 
-        // The n-1 gaps sum to the rise, so rise/(n-1) is the mean gap. Testing against it keeps this scale-free.
-        final float threshold = KNEE_FACTOR * rise / (ranked - 1);
-        for (int i = 0; i < ranked - 1; i++) {
+        // The ranked - minProbes tail gaps sum to the rise, so this is the tail's mean gap. Testing against it keeps
+        // this scale-free; dividing first keeps a rise near Float.MAX_VALUE finite.
+        final float threshold = rise / (ranked - minProbes) * KNEE_FACTOR;
+        for (int i = first; i < ranked - 1; i++) {
             if (distances[i + 1] - distances[i] > threshold) {
-                // Search the whole curve, then clamp. Searching from the floor would miss a knee below it and keep
-                // every ranked cluster — the opposite of what the curve asked for.
-                return Math.max(i + 1, minProbes);
+                return i + 1;
             }
         }
         return ranked;

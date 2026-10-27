@@ -32,8 +32,10 @@ import java.util.List;
  *
  * <p>Ranks on a distance-like key (smaller is closer)
  *
- * <p>The ceiling bounds what a query may spend; {@link CentroidKneePruner} cuts what it should not. Unfiltered
- * plans only.
+ * <p>The ceiling bounds what a query may spend; {@link CentroidKneePruner} cuts what it should not. A filtered plan
+ * is cut over its eligible clusters too, at any selectivity, unless it is planning every accepted vector, and never
+ * short of the clusters it takes to hold {@code k} accepted vectors (or of everything ranked, when even that holds
+ * fewer).
  *
  * <p>Stateless and thread-safe: the only cursor it uses is a private copy taken per call.
  */
@@ -81,18 +83,19 @@ public final class CentroidPlanner {
 
         final LongValues ordToCentroid = clusters.ordToCentroid();
         final FixedBitSet acceptedCentroids = new FixedBitSet(clusters.numClusters());
+        final int[] acceptedPerCluster = new int[clusters.numClusters()];
         final DocIdSetIterator acceptedDocs = acceptDocs.iterator();
         int acceptedVectors = 0;
         if (clusters.hasDenseVectorValues()) {
             for (int doc = acceptedDocs.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = acceptedDocs.nextDoc()) {
-                acceptedCentroids.set((int) ordToCentroid.get(doc));
+                accept(acceptedCentroids, acceptedPerCluster, (int) ordToCentroid.get(doc));
                 acceptedVectors++;
             }
         } else {
             final KnnVectorValues.DocIndexIterator vectorDocs = vectorDocsSupplier.get();
             final DocIdSetIterator acceptedVectorDocs = ConjunctionUtils.intersectIterators(List.of(acceptedDocs, vectorDocs));
             while (acceptedVectorDocs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
-                acceptedCentroids.set((int) ordToCentroid.get(vectorDocs.index()));
+                accept(acceptedCentroids, acceptedPerCluster, (int) ordToCentroid.get(vectorDocs.index()));
                 acceptedVectors++;
             }
         }
@@ -104,8 +107,20 @@ public final class CentroidPlanner {
         }
         final double selectivity = (double) acceptedVectors / clusters.numVectors();
         final int budget = PlanParams.forSelectivity(clusters.numClusters(), selectivity).maxProbes();
-        final int maxProbes = acceptedVectors <= k ? eligibleClusters : Math.max(budget, params.maxProbes());
-        return probes(clusters, query, maxProbes, params.minProbes(), acceptedCentroids);
+        final boolean everyAccepted = acceptedVectors <= k;
+        final int maxProbes = everyAccepted ? eligibleClusters : Math.max(budget, params.maxProbes());
+        final NeighborQueue nearest = rank(clusters, query, maxProbes, acceptedCentroids);
+        // Never cut when the caller wants every accepted vector: that would drop results the plan exists to return.
+        if (everyAccepted) {
+            return closestFirst(nearest);
+        }
+        return closestFirstPruned(nearest, params.minProbes(), acceptedPerCluster, k);
+    }
+
+    /** Marks a centroid eligible and counts one more accepted vector assigned to it. */
+    private static void accept(final FixedBitSet acceptedCentroids, final int[] acceptedPerCluster, final int centroid) {
+        acceptedCentroids.set(centroid);
+        acceptedPerCluster[centroid]++;
     }
 
     /**
@@ -123,17 +138,15 @@ public final class CentroidPlanner {
         if (clusters.numClusters() == 0) {
             return NO_PROBES;
         }
-        return probes(clusters, query, params.maxProbes(), params.minProbes(), null);
+        return closestFirstPruned(rank(clusters, query, params.maxProbes(), null), params.minProbes(), null, 0);
     }
 
     /**
-     * Rank the candidate centroids and name the clusters to visit, closest first.
+     * Rank the candidate centroids, keeping the {@code maxProbes} nearest non-empty ones in a heap.
      *
      * @param eligibleCentroids ordinals to consider, or null when nothing is filtered out
-     * @param minProbes floor the knee may not cut below
      */
-    private static int[] probes(Clusters clusters, float[] query, int maxProbes, int minProbes, FixedBitSet eligibleCentroids)
-        throws IOException {
+    private static NeighborQueue rank(Clusters clusters, float[] query, int maxProbes, FixedBitSet eligibleCentroids) throws IOException {
         final int numClusters = clusters.numClusters();
         final VectorSimilarityFunction similarity = clusters.clusterMeta().similarityFunction();
         final CentroidVectorValues centroids = clusters.centroids();
@@ -150,7 +163,7 @@ public final class CentroidPlanner {
             }
         }
 
-        return closestFirstPruned(nearest, minProbes, eligibleCentroids);
+        return nearest;
     }
 
     /** The first candidate ordinal at or after {@code from}: {@code from} itself when nothing is filtered out. */
@@ -186,11 +199,23 @@ public final class CentroidPlanner {
         };
     }
 
+    /** Drain the heap into ordinals, closest-first. {@code pop} yields farthest first, so the array fills from the back. */
+    private static int[] closestFirst(final NeighborQueue nearest) {
+        final int[] probes = new int[nearest.size()];
+        for (int i = probes.length - 1; i >= 0; i--) {
+            probes[i] = nearest.pop();
+        }
+        return probes;
+    }
+
     /**
-     * Drain the heap into ordinals, closest-first, cutting at the knee when unfiltered. {@code pop} yields farthest
-     * first, so both arrays fill from the back; the keys ride along because the heap is the only place the curve is.
+     * Drain the heap into ordinals, closest-first, cutting at the knee. {@code pop} yields farthest first, so both
+     * arrays fill from the back; the keys ride along because the heap is the only place the curve is.
+     *
+     * @param acceptedPerCluster accepted vectors assigned to each cluster, or null when nothing is filtered out
+     * @param k the number of results the caller wants; read only with {@code acceptedPerCluster}
      */
-    private static int[] closestFirstPruned(final NeighborQueue nearest, final int minProbes, FixedBitSet eligibleCentroids) {
+    private static int[] closestFirstPruned(final NeighborQueue nearest, final int minProbes, final int[] acceptedPerCluster, final int k) {
         final int ranked = nearest.size();
         final int[] probes = new int[ranked];
         final float[] distances = new float[ranked];
@@ -199,13 +224,28 @@ public final class CentroidPlanner {
             probes[i] = nearest.pop();
         }
 
-        // TODO: eligibleCentroids is non-null on a filtered query. Rather than skip pruning outright, decide from
-        // filter selectivity: above ~0.7-0.8 the curve is still mostly the query's own geometry and can take the cut.
-        if (eligibleCentroids != null) {
-            return probes;
+        int keep = CentroidKneePruner.prune(distances, minProbes);
+        if (acceptedPerCluster != null && keep < ranked) {
+            keep = holdingK(probes, keep, acceptedPerCluster, k);
         }
-
-        final int keep = CentroidKneePruner.prune(distances, minProbes);
         return keep == ranked ? probes : Arrays.copyOf(probes, keep);
+    }
+
+    /**
+     * Extends a cut until the clusters it keeps hold {@code k} accepted vectors between them, or until nothing ranked
+     * is left. The knee reads distances alone, so under a filter that sits away from the query the clusters before it
+     * can hold too few accepted vectors to answer {@code k}. Counts primary assignments only, which a cluster's SOAR
+     * copies can only add to, so the extension never stops short.
+     */
+    private static int holdingK(final int[] probes, final int keep, final int[] acceptedPerCluster, final int k) {
+        long held = 0;
+        for (int i = 0; i < keep; i++) {
+            held += acceptedPerCluster[probes[i]];
+        }
+        int extended = keep;
+        while (held < k && extended < probes.length) {
+            held += acceptedPerCluster[probes[extended++]];
+        }
+        return extended;
     }
 }
