@@ -24,13 +24,18 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Reads the suite file named by {@code -Dknn.suite}, merging each scenario's overrides over the file's defaults and
- * rejecting unknown keys, so a typo fails rather than being carried silently.
+ * Reads the suite files named by {@code -Dknn.suite} (comma-separated; default: the three committed 1k suites),
+ * merging each scenario's overrides over its file's defaults and rejecting unknown keys, so a typo fails rather than
+ * being carried silently.
  */
 public final class Suite {
     private static final Logger log = LogManager.getLogger(Suite.class);
 
-    private static final Path DEFAULT_FILE = Paths.get("src/test/resources/cohere-1k-suite.yml");
+    // k-NN: formats also runs sift-1k-suite.yml and glove-1k-suite.yml by default. Their corpora are chunked HDF5,
+    // and jhdf cannot decode those here because the OpenSearch build resolves dependencies non-transitively, which
+    // leaves out jhdf's compress-lzf and lz4-java. Name them in -Dknn.suite once those are on the test classpath.
+    /** The suites every build runs: the same scenario grid over one corpus per metric, all committed. */
+    static final List<Path> DEFAULT_FILES = List.of(Paths.get("src/test/resources/cohere-1k-suite.yml"));
 
     private static final String DEFAULT_CODEC = "Lucene103";
 
@@ -47,21 +52,43 @@ public final class Suite {
         "similarity",
         "file"
     );
-    private static final Set<String> INDEX_KEYS = Set.of("docsPerSegment", "expectFiles", "forceMerge");
+    private static final Set<String> INDEX_KEYS = Set.of("docsPerSegment", "expectFiles", "forceMerge", "childrenPerParent");
     private static final Set<String> SEARCH_KEYS = Set.of("k", "queries", "repeat", "warmup", "threads", "scoreTolerance", "scoreBias");
     private static final Set<String> CODEC_KEYS = Set.of("name", "params");
 
     private Suite() {}
 
-    public static Path file() {
-        return Paths.get(System.getProperty("knn.suite", DEFAULT_FILE.toString()));
+    /** The suite files to run: {@code -Dknn.suite=a.yml,b.yml}, or {@link #DEFAULT_FILES} when unset. */
+    public static List<Path> files() {
+        final String property = System.getProperty("knn.suite");
+        if (property == null || property.isBlank()) {
+            return DEFAULT_FILES;
+        }
+        final List<Path> files = new ArrayList<>();
+        for (final String part : property.split(",")) {
+            if (!part.isBlank()) {
+                files.add(Paths.get(part.trim()));
+            }
+        }
+        if (files.isEmpty()) {
+            throw new IllegalArgumentException("knn.suite names no file: \"" + property + "\"");
+        }
+        return files;
     }
 
+    /** Every scenario of every file in {@link #files()}, in file order. */
     public static List<Scenario> load() {
-        final Path file = file();
+        final List<Scenario> all = new ArrayList<>();
+        for (final Path file : files()) {
+            all.addAll(load(file));
+        }
+        return all;
+    }
+
+    static List<Scenario> load(final Path file) {
         if (Files.notExists(file)) {
             log.info("No suite file at {}, running the single default scenario", file.toAbsolutePath());
-            return List.of(scenario("default", Map.of()));
+            return List.of(scenario(file, "default", Map.of()));
         }
 
         final Map<String, Object> document = read(file);
@@ -82,19 +109,10 @@ public final class Suite {
             if (!names.add(name.toString())) {
                 throw new IllegalArgumentException("Duplicate scenario name \"" + name + "\" in " + file);
             }
-            loaded.add(scenario(name.toString(), merge(defaults, overrides, file)));
+            loaded.add(scenario(file, name.toString(), merge(defaults, overrides, file)));
         }
 
         log.info("Loaded {} scenarios from {}: {}", loaded.size(), file.toAbsolutePath(), names);
-        for (final Scenario candidate : loaded) {
-            if (!candidate.codec().params().isEmpty()) {
-                log.warn(
-                    "Scenario \"{}\" sets codec params {} which nothing applies yet; the codec is still resolved by name",
-                    candidate.name(),
-                    candidate.codec().params()
-                );
-            }
-        }
         return loaded;
     }
 
@@ -138,7 +156,7 @@ public final class Suite {
         return result;
     }
 
-    private static Scenario scenario(final String name, final Map<String, Object> merged) {
+    private static Scenario scenario(final Path suite, final String name, final Map<String, Object> merged) {
         final Map<String, Object> corpus = checkedSection(merged, "corpus", CORPUS_KEYS);
         final Map<String, Object> index = checkedSection(merged, "index", INDEX_KEYS);
         final Map<String, Object> search = checkedSection(merged, "search", SEARCH_KEYS);
@@ -180,9 +198,15 @@ public final class Suite {
         }
 
         return new Scenario(
+            suite,
             name,
             corpusSpec,
-            new Scenario.IndexSpec(integer(index, "docsPerSegment", 1_000), strings(index, "expectFiles"), segments(index)),
+            new Scenario.IndexSpec(
+                integer(index, "docsPerSegment", 1_000),
+                strings(index, "expectFiles"),
+                segments(index),
+                childrenPerParent(index)
+            ),
             searchSpec,
             new Scenario.CodecSpec(string(codec, "name", DEFAULT_CODEC), params(codec))
         );
@@ -229,6 +253,14 @@ public final class Suite {
             throw new IllegalArgumentException("\"forceMerge\" must be at least 1 segment, got " + segments);
         }
         return segments.intValue();
+    }
+
+    private static int childrenPerParent(final Map<String, Object> section) {
+        final int children = integer(section, "childrenPerParent", 0);
+        if (children < 0) {
+            throw new IllegalArgumentException("\"childrenPerParent\" must be 0 (flat) or a positive number, got " + children);
+        }
+        return children;
     }
 
     private static List<String> strings(final Map<String, Object> section, final String key) {

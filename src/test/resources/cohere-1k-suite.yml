@@ -1,4 +1,5 @@
-# Default suite: 1000 Cohere embeddings through the ClusterANN format. Runs on every build.
+# Default suite: 1000 Cohere embeddings through the ClusterANN format. Runs on every build alongside sift-1k (L2)
+# and glove-1k (cosine); the three cover one corpus per metric.
 #
 #   brazil-build test
 #
@@ -62,3 +63,13 @@ scenarios:
     index: {forceMerge: 1}
     search: {scoreTolerance: 3.0}
     codec: {params: {quantization: {docBits: 4}}}
+
+  # Data-blind int8 (IVFaster style): Hadamard rotation + absolute maxAbs/127, no centroid residual.
+  # 8-bit codes are near-exact, so recall is high and the score tolerance is tight.
+  - name: int8-flushed
+    search: {scoreTolerance: 2.0}
+    codec: {params: {quantization: {encoding: DATA_BLIND_INT8, docBits: 8}}}
+  - name: int8-merged
+    index: {forceMerge: 1}
+    search: {scoreTolerance: 2.0}
+    codec: {params: {quantization: {encoding: DATA_BLIND_INT8, docBits: 8}}}

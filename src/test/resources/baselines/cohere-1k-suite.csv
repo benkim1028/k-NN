@@ -7,3 +7,5 @@ scenario,corpus,codec,k,queries,recall,p50Millis,p90Millis
 1bit-merged,documents-1k-n1000-q1000,ClusterANN1030TestCodec,10,200,0.6565,0.16725,0.195208
 4bit-flushed,documents-1k-n1000-q1000,ClusterANN1030TestCodec,10,200,0.9105,0.303584,0.335083
 2bit-flushed,documents-1k-n1000-q1000,ClusterANN1030TestCodec,10,200,0.797,0.248417,0.270125
+int8-flushed,documents-1k-n1000-q1000,ClusterANN1030TestCodec,10,200,0.985,0.374125,0.414375
+int8-merged,documents-1k-n1000-q1000,ClusterANN1030TestCodec,10,200,0.985,0.405959,0.446458

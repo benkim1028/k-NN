@@ -36,6 +36,8 @@ benchmarks/perf-tool/okpt/venv/
 benchmarks/perf-tool/okpt/.pytype/
 
 # Benchmark corpora downloaded on demand by the ClusterANN component test (Hdf5Corpus); hundreds of MB each.
-# The 1k smoke corpus is small and committed.
+# The 1k smoke corpora are small and committed.
 /src/test/resources/dataset/*
 !/src/test/resources/dataset/documents-1k.hdf5
+!/src/test/resources/dataset/sift-128-euclidean-sample1000-q1000-seed42.hdf5
+!/src/test/resources/dataset/glove-100-angular-sample1000-q1000-seed42.hdf5

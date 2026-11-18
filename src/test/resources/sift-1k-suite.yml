@@ -1,0 +1,87 @@
+# Default suite: 1000 SIFT descriptors under L2 through the ClusterANN format. Runs on every build alongside
+# cohere-1k (inner product) and glove-1k (cosine); the three cover one corpus per metric.
+#
+#   brazil-build single-test -DtestClass=org.opensearch.knn.vectorformats.codec.component.KNNVectorFormatsComponentTest \
+#       -Dtests.extra.jvmargs="-Dknn.suite=src/test/resources/sift-1k-suite.yml"
+#
+# The corpus is committed at src/test/resources/dataset/sift-128-euclidean-sample1000-q1000-seed42.hdf5 (0.8 MB), so
+# no build fetches anything. It was cut by the sampler out of ann-benchmarks sift-128-euclidean (train 1,000,000 x
+# 128, test 10,000 x 128, 100 neighbours; 501 MB): 1000 seeded rows, exact ground truth for the first 1000 queries.
+# To regenerate it (or the 10k sibling), see "Sampling a corpus" in the README:
+#
+#   brazil-build single-test -DtestClass=org.opensearch.knn.vectorformats.codec.component.corpus.Hdf5SamplerRun \
+#       -Dtests.extra.jvmargs="-Dknn.sample.standard=true"
+#
+# Like cohere-1k, a smoke test at this size, not a measurement: 1000 vectors is two or three clusters. Its value is
+# the metric: SIFT is the L2 corpus, where Cohere is inner product and GloVe (glove-1k-suite.yml) is cosine.
+
+defaults:
+  corpus:
+    type: hdf5
+    file: src/test/resources/dataset/sift-128-euclidean-sample1000-q1000-seed42.hdf5
+    # Required: the file's neighbours were computed under L2; the name says so, and Hdf5Corpus warns if this disagrees.
+    similarity: euclidean
+    size: 1000
+    queries: 1000
+
+  index:
+    # Four segments, so flushed scenarios span more than one and merged ones have something to merge.
+    docsPerSegment: 250
+    # Without this, Lucene's exact-search fallback would be reported as this format's recall.
+    expectFiles: [clap, clac]
+
+  search:
+    k: 10
+    queries: 200
+    repeat: 1
+    warmup: -1
+    # Lucene's L2 score is 1 / (1 + d^2); SIFT distances are in the hundreds, so exact scores are around 2e-5 to 6e-5
+    # and a quantized score can be off by most of that. Measured maxima over 2000 hits: 2.8e-5 at 1 bit, 3.3e-5 at 2,
+    # 2.4e-5 at 4 (the widths do not separate here, so one bound). Mean signed error measured at -2e-7 to -6e-7.
+    scoreTolerance: 4.0e-5
+    scoreBias: 1.0e-6
+
+  codec:
+    name: ClusterANN1030TestCodec
+    params:
+      quantization:
+        # 1, 2 or 4 only.
+        docBits: 1
+
+scenarios:
+  # Measured recall@10: 0.61 flushed / 0.68 merged at 1 bit, 0.75 / 0.82 at 2, 0.90 / 0.93 at 4.
+  - name: 1bit-flushed
+  - name: 1bit-merged
+    index: {forceMerge: 1}
+
+  - name: 2bit-flushed
+    codec: {params: {quantization: {docBits: 2}}}
+  - name: 2bit-merged
+    index: {forceMerge: 1}
+    codec: {params: {quantization: {docBits: 2}}}
+
+  - name: 4bit-flushed
+    codec: {params: {quantization: {docBits: 4}}}
+  - name: 4bit-merged
+    index: {forceMerge: 1}
+    codec: {params: {quantization: {docBits: 4}}}
+
+  # Data-blind int8 (IVFaster style): Hadamard rotation + absolute maxAbs/127, no centroid residual. Applied for
+  # every metric, L2 included. 8-bit codes are near-exact: measured max score error 1.4e-6 over 2000 hits, mean
+  # signed 8e-9 — an order of magnitude under even the 4-bit bound. Recall 0.9855, above 4 bit's 0.90/0.93.
+  - name: int8-flushed
+    search: {scoreTolerance: 3.0e-6, scoreBias: 1.0e-7}
+    codec: {params: {quantization: {encoding: DATA_BLIND_INT8, docBits: 8}}}
+  - name: int8-merged
+    index: {forceMerge: 1}
+    search: {scoreTolerance: 3.0e-6, scoreBias: 1.0e-7}
+    codec: {params: {quantization: {encoding: DATA_BLIND_INT8, docBits: 8}}}
+
+  # Nested: the corpus indexed as OpenSearch indexes a nested field, three vector children then a parent without one,
+  # so the writer persists a sparse ord -> doc mapping. Searched per child (no join), so recall compares to 4bit-*.
+  - name: nested-4bit-flushed
+    index: {childrenPerParent: 3}
+    codec: {params: {quantization: {docBits: 4}}}
+  - name: nested-4bit-merged
+    index: {childrenPerParent: 3, forceMerge: 1}
+    codec: {params: {quantization: {docBits: 4}}}

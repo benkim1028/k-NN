@@ -59,6 +59,15 @@ scenarios:
     index: {forceMerge: 1}
     codec: {params: {quantization: {docBits: 4}}}
 
+  # Data-blind int8 (IVFaster style): Hadamard rotation + absolute maxAbs/127, no centroid residual. 8-bit codes are
+  # near-exact, so this is the recall ceiling of the family at eight times the posting bytes of 1 bit. The score
+  # bound is the loose suite default; tighten it to just above what a clean run reports.
+  - name: int8-flushed
+    codec: {params: {quantization: {encoding: DATA_BLIND_INT8, docBits: 8}}}
+  - name: int8-merged
+    index: {forceMerge: 1}
+    codec: {params: {quantization: {encoding: DATA_BLIND_INT8, docBits: 8}}}
+
   # Flushed only: a merged index is one leaf with nothing to search concurrently. These rows exist for their latency.
   - name: 1bit-flushed-threads4
     search: {threads: 4}
@@ -89,3 +98,12 @@ scenarios:
     index: {forceMerge: 1}
     search: {k: 100}
     codec: {params: {quantization: {docBits: 4}}}
+
+  # int8 at k=100, the OSB-reported depth — the recall ceiling at the workload's own metric.
+  - name: int8-flushed-k100
+    search: {k: 100}
+    codec: {params: {quantization: {encoding: DATA_BLIND_INT8, docBits: 8}}}
+  - name: int8-merged-k100
+    index: {forceMerge: 1}
+    search: {k: 100}
+    codec: {params: {quantization: {encoding: DATA_BLIND_INT8, docBits: 8}}}

@@ -1,0 +1,11 @@
+# Recall and latency per set of parameters. Regenerate a row by rerunning with -Dknn.updateBaselines.
+# Latency is machine-dependent and recorded for comparison; only recall is asserted by default.
+scenario,corpus,codec,k,queries,recall,p50Millis,p90Millis
+1bit-merged,glove-100-angular-sample1000-q1000-seed42-n1000-q1000,ClusterANN1030TestCodec,10,200,0.356,0.193542,0.408458
+4bit-flushed,glove-100-angular-sample1000-q1000-seed42-n1000-q1000,ClusterANN1030TestCodec,10,200,0.81,0.14325,0.7135
+2bit-flushed,glove-100-angular-sample1000-q1000-seed42-n1000-q1000,ClusterANN1030TestCodec,10,200,0.5935,0.12125,0.208375
+4bit-merged,glove-100-angular-sample1000-q1000-seed42-n1000-q1000,ClusterANN1030TestCodec,10,200,0.825,0.075917,0.085375
+2bit-merged,glove-100-angular-sample1000-q1000-seed42-n1000-q1000,ClusterANN1030TestCodec,10,200,0.5785,0.106125,0.133792
+1bit-flushed,glove-100-angular-sample1000-q1000-seed42-n1000-q1000,ClusterANN1030TestCodec,10,200,0.3645,0.078375,0.089083
+int8-flushed,glove-100-angular-sample1000-q1000-seed42-n1000-q1000,ClusterANN1030TestCodec,10,200,0.9865,0.219208,0.527875
+int8-merged,glove-100-angular-sample1000-q1000-seed42-n1000-q1000,ClusterANN1030TestCodec,10,200,0.9865,0.076042,0.084166

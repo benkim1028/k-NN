@@ -34,11 +34,12 @@ import java.util.Map;
 public final class Hdf5Corpus implements Corpus, AutoCloseable {
     private static final Logger log = LogManager.getLogger(Hdf5Corpus.class);
 
-    private static final String TRAIN = "train";
-    private static final String TEST = "test";
-    private static final String NEIGHBOURS = "neighbors";
+    static final String TRAIN = "train";
+    static final String TEST = "test";
+    static final String NEIGHBOURS = "neighbors";
 
-    private static final int BLOCK_ROWS = 1024;
+    /** Rows per read of {@code train}; also the chunk height the sampler writes, so a block is one chunk. */
+    static final int BLOCK_ROWS = 1024;
 
     private static final int CACHED_BLOCKS = 4;
 
@@ -149,7 +150,11 @@ public final class Hdf5Corpus implements Corpus, AutoCloseable {
         }
     }
 
-    private static Path resolve(final String location) {
+    /**
+     * A local path as given, or a URL fetched into {@code knn.corpus.dir} on a cache miss ({@code .bz2} decompressed
+     * as it arrives). Package-private so the sampler shares the cache rather than keeping its own.
+     */
+    static Path resolve(final String location) {
         final boolean remote = location.startsWith("http://") || location.startsWith("https://");
         if (!remote) {
             final Path file = Paths.get(location);
@@ -174,7 +179,7 @@ public final class Hdf5Corpus implements Corpus, AutoCloseable {
 
         final boolean compressed = remoteName.endsWith(".bz2");
         final String cachedName = compressed ? remoteName.substring(0, remoteName.length() - ".bz2".length()) : remoteName;
-        final Path directory = Paths.get(System.getProperty("knn.corpus.dir", DEFAULT_CACHE));
+        final Path directory = corpusDirectory();
         final Path target = directory.resolve(cachedName);
         if (Files.exists(target)) {
             log.info("Using cached corpus {} ({} MB)", target, megabytes(target));
@@ -227,6 +232,11 @@ public final class Hdf5Corpus implements Corpus, AutoCloseable {
         }
     }
 
+    /** Where downloaded corpora are cached and where sampled ones land: {@code knn.corpus.dir}, or the test dataset dir. */
+    static Path corpusDirectory() {
+        return Paths.get(System.getProperty("knn.corpus.dir", DEFAULT_CACHE));
+    }
+
     private static long megabytes(final Path file) {
         try {
             return Files.size(file) / (1024 * 1024);
@@ -270,14 +280,7 @@ public final class Hdf5Corpus implements Corpus, AutoCloseable {
     private float[][] readBlock(final int blockIndex) {
         final int from = blockIndex * BLOCK_ROWS;
         final int rows = Math.min(BLOCK_ROWS, size - from);
-        final Object data = trainSet.getData(new long[] { from, 0 }, new int[] { rows, dimension });
-        if (data instanceof float[][] floatRows) {
-            return floatRows;
-        }
-        if (data instanceof double[][] doubleRows) {
-            return narrow(doubleRows);
-        }
-        throw new IllegalArgumentException(TRAIN + " holds " + data.getClass().getSimpleName() + ", expected a 2D float or double array");
+        return rows(trainSet.getData(new long[] { from, 0 }, new int[] { rows, dimension }), TRAIN);
     }
 
     @Override
@@ -326,9 +329,10 @@ public final class Hdf5Corpus implements Corpus, AutoCloseable {
     }
 
     private void recomputeNeighbours(final int depth) {
-        final int[][] bestRows = new int[queries.length][depth];
-        final float[][] bestScores = new float[queries.length][depth];
-        final int[] held = new int[queries.length];
+        final TopK[] best = new TopK[queries.length];
+        for (int query = 0; query < queries.length; query++) {
+            best[query] = new TopK(depth);
+        }
 
         final long start = System.nanoTime();
         for (int from = 0; from < size; from += BLOCK_ROWS) {
@@ -337,37 +341,14 @@ public final class Hdf5Corpus implements Corpus, AutoCloseable {
             for (int row = 0; row < rows; row++) {
                 final float[] vector = block[row];
                 for (int query = 0; query < queries.length; query++) {
-                    held[query] = offer(
-                        bestRows[query],
-                        bestScores[query],
-                        held[query],
-                        from + row,
-                        similarity.compare(queries[query], vector)
-                    );
+                    best[query].offer(from + row, similarity.compare(queries[query], vector));
                 }
             }
         }
         for (int query = 0; query < queries.length; query++) {
-            neighbours[query] = Arrays.copyOf(bestRows[query], held[query]);
+            neighbours[query] = best[query].rows();
         }
         log.info("Recomputed ground truth in {} s", (System.nanoTime() - start) / 1_000_000_000L);
-    }
-
-    private static int offer(final int[] rows, final float[] scores, final int size, final int row, final float score) {
-        final int capacity = rows.length;
-        if (capacity == 0 || (size == capacity && score <= scores[capacity - 1])) {
-            return size;
-        }
-        final int next = size == capacity ? size : size + 1;
-        int at = size == capacity ? capacity - 1 : size;
-        while (at > 0 && scores[at - 1] < score) {
-            scores[at] = scores[at - 1];
-            rows[at] = rows[at - 1];
-            at--;
-        }
-        scores[at] = score;
-        rows[at] = row;
-        return next;
     }
 
     @Override
@@ -377,29 +358,38 @@ public final class Hdf5Corpus implements Corpus, AutoCloseable {
     }
 
     private static void warnIfNameDisagrees(final Path file, final VectorSimilarityFunction declared) {
-        final String lower = file.getFileName().toString().toLowerCase(Locale.ROOT);
-        final VectorSimilarityFunction implied;
-        if (lower.contains("euclidean") || lower.contains("-l2")) {
-            implied = VectorSimilarityFunction.EUCLIDEAN;
-        } else if (lower.contains("angular") || lower.contains("cosine")) {
-            implied = VectorSimilarityFunction.COSINE;
-        } else if (lower.contains("-ip") || lower.contains("innerproduct") || lower.contains("dot")) {
-            if (declared == VectorSimilarityFunction.DOT_PRODUCT || declared == VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT) {
-                return;
-            }
-            implied = VectorSimilarityFunction.DOT_PRODUCT;
-        } else {
+        final VectorSimilarityFunction implied = impliedSimilarity(file.getFileName().toString());
+        if (implied == null || implied == declared) {
             return;
         }
-        if (implied != declared) {
-            log.warn(
-                "{} looks like a {} dataset but the scenario declares {}; if that is wrong every query is scored against"
-                    + " the answers to a different question, and recall will look like the format's fault",
-                file.getFileName(),
-                implied,
-                declared
-            );
+        if (implied == VectorSimilarityFunction.DOT_PRODUCT && declared == VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT) {
+            return;
         }
+        log.warn(
+            "{} looks like a {} dataset but the scenario declares {}; if that is wrong every query is scored against"
+                + " the answers to a different question, and recall will look like the format's fault",
+            file.getFileName(),
+            implied,
+            declared
+        );
+    }
+
+    /**
+     * The metric an ann-benchmarks style file name advertises ({@code sift-128-euclidean}, {@code glove-100-angular},
+     * {@code lastfm-64-dot}), or {@code null} when the name says nothing. Angular is cosine.
+     */
+    static VectorSimilarityFunction impliedSimilarity(final String fileName) {
+        final String lower = fileName.toLowerCase(Locale.ROOT);
+        if (lower.contains("euclidean") || lower.contains("-l2")) {
+            return VectorSimilarityFunction.EUCLIDEAN;
+        }
+        if (lower.contains("angular") || lower.contains("cosine")) {
+            return VectorSimilarityFunction.COSINE;
+        }
+        if (lower.contains("-ip") || lower.contains("innerproduct") || lower.contains("dot")) {
+            return VectorSimilarityFunction.DOT_PRODUCT;
+        }
+        return null;
     }
 
     private static String name(final Path file, final int size, final int queries) {
@@ -409,16 +399,18 @@ public final class Hdf5Corpus implements Corpus, AutoCloseable {
     }
 
     private static float[][] floats(final Dataset dataset) {
-        final Object data = dataset.getData();
+        return rows(dataset.getData(), "Dataset \"" + dataset.getName() + "\"");
+    }
+
+    /** {@code data} as read by jhdf, as float rows; {@code what} names the dataset for the error. */
+    static float[][] rows(final Object data, final String what) {
         if (data instanceof float[][] rows) {
             return rows;
         }
         if (data instanceof double[][] rows) {
             return narrow(rows);
         }
-        throw new IllegalArgumentException(
-            "Dataset \"" + dataset.getName() + "\" holds " + data.getClass().getSimpleName() + ", expected a 2D float or double array"
-        );
+        throw new IllegalArgumentException(what + " holds " + data.getClass().getSimpleName() + ", expected a 2D float or double array");
     }
 
     private static float[][] narrow(final double[][] rows) {
@@ -452,7 +444,7 @@ public final class Hdf5Corpus implements Corpus, AutoCloseable {
         );
     }
 
-    private static Dataset dataset(final HdfFile hdf, final String path) {
+    static Dataset dataset(final HdfFile hdf, final String path) {
         final Dataset dataset = hdf.getDatasetByPath(path);
         if (dataset == null) {
             throw new IllegalArgumentException(
