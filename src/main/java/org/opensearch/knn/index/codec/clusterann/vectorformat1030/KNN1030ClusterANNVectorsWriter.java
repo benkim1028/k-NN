@@ -17,7 +17,9 @@ import org.apache.lucene.index.DocsWithFieldSet;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.KnnMergeAbortChecker;
 import org.apache.lucene.index.KnnVectorValues;
+import org.apache.lucene.index.MergePolicy;
 import org.apache.lucene.index.MergeState;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
@@ -28,7 +30,7 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.TaskExecutor;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.IOUtils;
-import org.opensearch.knn.clusterann.format.ClusterANNEncoding;
+import org.apache.lucene.util.VectorUtil;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
 import org.opensearch.knn.clusterann.format.QuantizationParams;
 import org.opensearch.knn.clusterann.write.CentroidsWriter;
@@ -37,11 +39,13 @@ import org.opensearch.knn.clusterann.write.CentroidsWriter.CentroidOffsets;
 import org.opensearch.knn.clusterann.format.rotation.Rotation;
 import org.opensearch.knn.clusterann.format.rotation.RotationFormats;
 import org.opensearch.knn.clusterann.format.rotation.RotationScheme;
+import org.opensearch.knn.clusterann.format.ClusterANNEncoding;
 import org.opensearch.knn.clusterann.write.postings.ClusterAnnPostingsWriter;
 import org.opensearch.knn.clusterann.write.postings.ClusterWriterFactory;
 import org.opensearch.knn.clusterann.write.postings.PostingsRegions;
 import org.opensearch.knn.clusterann.ClusteringResult;
 import org.opensearch.knn.clusterann.clustering.ClusterBuilder;
+import org.opensearch.knn.clusterann.stats.ClusterANNStat;
 
 import java.io.IOException;
 import java.util.AbstractList;
@@ -85,7 +89,7 @@ public class KNN1030ClusterANNVectorsWriter extends KnnVectorsWriter {
 
     private final SegmentWriteState segmentWriteState;
     private final QuantizationParams quantizationParams;
-    private final int ioFetchBytes;
+    private final int storageBlockBytes;
     private final FlatVectorsFormat rawFlatVectorsFormat;
     private final FlatVectorsWriter rawFlatVectorsWriter;
     private final List<FieldEntry> fields = new ArrayList<>();
@@ -102,25 +106,41 @@ public class KNN1030ClusterANNVectorsWriter extends KnnVectorsWriter {
     private boolean closed;
 
     /**
-     * Creates a writer for a single segment and opens its cluster files, writing each one's index header and
-     * the shared block size into {@code .clam}; field entries and footers follow in {@link #flush}/{@link
-     * #finish}.
+     * Creates a writer for a single segment with the default storage block size
+     * ({@link KNN1030ClusterANNVectorsFormat#DEFAULT_STORAGE_BLOCK_BYTES}).
+     *
+     * @param segmentWriteState    state describing the segment being written
+     * @param rawFlatVectorsFormat delegate flat-vectors format; supplies the writer that persists the raw
+     *     vectors and, on merge, the reader reopened over them
+     * @param quantizationParams   the encoding (backend + bit width) to quantize each field with
+     */
+    public KNN1030ClusterANNVectorsWriter(
+        final SegmentWriteState segmentWriteState,
+        final FlatVectorsFormat rawFlatVectorsFormat,
+        final QuantizationParams quantizationParams
+    ) throws IOException {
+        this(segmentWriteState, rawFlatVectorsFormat, quantizationParams, KNN1030ClusterANNVectorsFormat.DEFAULT_STORAGE_BLOCK_BYTES);
+    }
+
+    /**
+     * Creates a writer for a single segment and opens its cluster files, writing each one's index header;
+     * field entries and footers follow in {@link #flush}/{@link #finish}.
      *
      * @param segmentWriteState    state describing the segment being written
      * @param rawFlatVectorsFormat delegate flat-vectors format; supplies the writer that persists the raw
      *     vectors and, on merge, the reader reopened over them
      * @param quantizationParams         the encoding (backend + bit width) to quantize each field with
-     * @param ioFetchBytes               the byte budget of one code block, recorded per field in {@code .clam}
+     * @param storageBlockBytes    bytes the storage layer fetches in one block
      */
     public KNN1030ClusterANNVectorsWriter(
         final SegmentWriteState segmentWriteState,
         final FlatVectorsFormat rawFlatVectorsFormat,
         final QuantizationParams quantizationParams,
-        final int ioFetchBytes
+        final int storageBlockBytes
     ) throws IOException {
         this.rawFlatVectorsFormat = rawFlatVectorsFormat;
         this.quantizationParams = quantizationParams;
-        this.ioFetchBytes = ioFetchBytes;
+        this.storageBlockBytes = storageBlockBytes;
         this.segmentWriteState = segmentWriteState;
         boolean success = false;
         try {
@@ -129,8 +149,9 @@ public class KNN1030ClusterANNVectorsWriter extends KnnVectorsWriter {
             clac = openOutput(CENTROIDS_EXTENSION, CENTROIDS_CODEC_NAME);
             clap = openOutput(POSTINGS_EXTENSION, POSTINGS_CODEC_NAME);
             // .clar is opened lazily on the first rotated field, so an all-unrotated segment writes none.
-            // One budget for the segment: every field's blocks are cut to the same fetch unit.
-            clam.writeVInt(ioFetchBytes);
+            // k-NN only: the segment's block budget follows the .clam header, as 3-5-cluster-ann segments carry it.
+            // Each field entry still records its own vectorsPerBlock, which is what the reader sizes blocks by.
+            clam.writeVInt(storageBlockBytes);
             success = true;
         } finally {
             if (!success) {
@@ -174,8 +195,22 @@ public class KNN1030ClusterANNVectorsWriter extends KnnVectorsWriter {
         ensureSingleVectorField(fields.size());
         rawFlatVectorsWriter.flush(maxDoc, docMap);
         for (final FieldEntry field : fields) {
+            // The raw vectors are already on disk, so a cosine field's buffer can be normalized in place for
+            // clustering and quantization, which need unit vectors.
+            if (isCosine(field.fieldInfo)) {
+                normalizeInPlace(field.flat.getVectors());
+            }
             final FieldVectors source = source(field, docMap);
-            writeField(field.fieldInfo, source.vectors, source.docsWithField, maxDoc, null); // flush clusters inline
+            final long tFlush0 = System.nanoTime();
+            try {
+                writeField(field.fieldInfo, source.vectors, source.docsWithField, maxDoc, null); // flush clusters inline
+            } catch (final IOException | RuntimeException e) {
+                ClusterANNStat.FLUSH_ERRORS.increment();
+                throw e;
+            }
+            ClusterANNStat.FLUSH_OPERATIONS.increment();
+            ClusterANNStat.FLUSH_TIME_MS.record((System.nanoTime() - tFlush0) / 1_000_000);
+            ClusterANNStat.FLUSH_DOCS.incrementBy(source.vectors.size());
         }
         log.debug("flush segment [{}]: wrote {} field(s)", segmentWriteState.segmentInfo.name, fields.size());
     }
@@ -190,6 +225,7 @@ public class KNN1030ClusterANNVectorsWriter extends KnnVectorsWriter {
      *
      * @param fieldInfo  metadata for the field being merged
      * @param mergeState state of the merge
+     * @throws MergePolicy.MergeAbortedException if the merge is aborted while the field is being built
      * @throws IOException if merging, reopening, or writing fails
      */
     @Override
@@ -203,14 +239,37 @@ public class KNN1030ClusterANNVectorsWriter extends KnnVectorsWriter {
         ensureFlatReaderOpen();
 
         final FloatVectorValues vectors = flatReader.getFloatVectorValues(fieldInfo.name);
+        // The reopened vectors are the flat file's, so a cosine field reads them through a normalizing view
+        // rather than normalizing them in place.
+        final FloatVectorValues prepared = isCosine(fieldInfo) ? new NormalizedFloatVectorValues(vectors) : vectors;
         // Merge is the heavy path — cluster in parallel on the merge's executor (flush clusters inline).
-        writeField(
-            fieldInfo,
-            vectors,
-            docsWithField(vectors),
-            mergeState.segmentInfo.maxDoc(),
-            new TaskExecutor(mergeState.intraMergeTaskExecutor)
-        );
+        ClusterANNStat.MERGE_CURRENT_OPERATIONS.increment();
+        final long tMerge0 = System.nanoTime();
+        try {
+            writeField(
+                fieldInfo,
+                prepared,
+                docsWithField(vectors),
+                mergeState.segmentInfo.maxDoc(),
+                new TaskExecutor(mergeState.intraMergeTaskExecutor)
+            );
+            // Success-path metrics stay inside the try so they only record when the merge actually completed.
+            ClusterANNStat.MERGE_OPERATIONS.increment();
+            ClusterANNStat.MERGE_TIME_MS.record((System.nanoTime() - tMerge0) / 1_000_000);
+            ClusterANNStat.MERGE_DOCS.incrementBy(vectors.size());
+        } catch (final MergePolicy.MergeAbortedException e) {
+            // A cancelled merge is not a failure: Lucene discards the segment and swallows the exception.
+            ClusterANNStat.MERGE_ABORTED.increment();
+            log.warn("merge segment [{}]: aborted while building field [{}]", segmentWriteState.segmentInfo.name, fieldInfo.name);
+            throw e;
+        } catch (final IOException | RuntimeException e) {
+            ClusterANNStat.MERGE_ERRORS.increment();
+            throw e;
+        } finally {
+            // finally (not catch) so the gauge is balanced even if writeField throws an Error (e.g. OOM) on this
+            // heavy clustering path — otherwise MERGE_CURRENT_OPERATIONS would drift up for the life of the process.
+            ClusterANNStat.MERGE_CURRENT_OPERATIONS.decrement();
+        }
         log.debug("merge segment [{}]: clustered field [{}]", segmentWriteState.segmentInfo.name, fieldInfo.name);
     }
 
@@ -330,6 +389,82 @@ public class KNN1030ClusterANNVectorsWriter extends KnnVectorsWriter {
      *   <li>append the {@code .clam} entry that records the field's shape and where the above regions landed.</li>
      * </ol>
      */
+    /**
+     * Records clustering-structure metrics for one field: centroid count, cluster-size distribution
+     * (avg/min/max/empty/skew) from the primary {@code assignments}, and SOAR spill from the secondary
+     * assignments. These expose IVF over/under-clustering and skew — ClusterANN health signals that have
+     * no HNSW-graph equivalent.
+     */
+    private static void recordClusteringStructure(final ClusteringResult clusters, final int numVectors) {
+        final int numCentroids = clusters.numCentroids();
+        ClusterANNStat.CENTROID_COUNT.record(numCentroids);
+        if (numCentroids <= 0) {
+            return;
+        }
+
+        final int[] sizes = new int[numCentroids];
+        for (final int a : clusters.assignments()) {
+            if (a >= 0 && a < numCentroids) {
+                sizes[a]++;
+            }
+        }
+        int maxSize = 0;
+        int minSize = Integer.MAX_VALUE;
+        int empty = 0;
+        for (final int s : sizes) {
+            if (s > maxSize) {
+                maxSize = s;
+            }
+            if (s < minSize) {
+                minSize = s;
+            }
+            if (s == 0) {
+                empty++;
+            }
+        }
+        final long avgSize = (long) numVectors / numCentroids;
+        ClusterANNStat.AVG_CLUSTER_SIZE.record(avgSize);
+        ClusterANNStat.MAX_CLUSTER_SIZE.record(maxSize);
+        ClusterANNStat.MIN_CLUSTER_SIZE.record(minSize == Integer.MAX_VALUE ? 0 : minSize);
+        if (empty > 0) {
+            ClusterANNStat.EMPTY_CLUSTERS.incrementBy(empty);
+        }
+        // Skew = max/avg as basis points; 10000 bps == perfectly balanced, higher == more skewed.
+        if (avgSize > 0) {
+            ClusterANNStat.CLUSTER_SIZE_SKEW_BPS.record((maxSize * 10_000L) / avgSize);
+        }
+
+        // SOAR spill: primary secondaries plus any extra ragged secondaries.
+        int spillVectors = 0;
+        long soarAssignments = 0;
+        final int[] soar = clusters.soarAssignments();
+        final int[][] extraSoar = clusters.extraSoarAssignments();
+        for (int i = 0; i < soar.length; i++) {
+            int perVector = 0;
+            if (soar[i] >= 0) {
+                perVector++;
+            }
+            if (extraSoar != null && i < extraSoar.length && extraSoar[i] != null) {
+                for (final int e : extraSoar[i]) {
+                    if (e >= 0) {
+                        perVector++;
+                    }
+                }
+            }
+            if (perVector > 0) {
+                spillVectors++;
+                soarAssignments += perVector;
+            }
+        }
+        if (soarAssignments > 0) {
+            ClusterANNStat.SOAR_ASSIGNMENTS.incrementBy(soarAssignments);
+            ClusterANNStat.SOAR_SPILL_VECTORS.incrementBy(spillVectors);
+        }
+        if (numVectors > 0) {
+            ClusterANNStat.SOAR_SPILL_RATE_BPS.record((spillVectors * 10_000L) / numVectors);
+        }
+    }
+
     private void writeField(
         final FieldInfo fieldInfo,
         final FloatVectorValues vectors,
@@ -344,10 +479,19 @@ public class KNN1030ClusterANNVectorsWriter extends KnnVectorsWriter {
 
         clam.writeInt(fieldInfo.number); // the field number precedes every .clam entry, empty or not
 
+        // Metrics: flush records inline (executor == null); merge runs on the merge executor.
+        final boolean isMerge = executor != null;
+
         // The backend's on-disk .clam code; the write side owns the enum->id mapping, not the upstream enum.
         final int quantizerId = ClusterWriterFactory.quantizerId(quantizationParams.encoding());
 
+        // Reject a width the backend cannot honour before writing any .clam, so an empty field (which records
+        // docBits but never builds a ClusterWriterFactory) fails identically to a non-empty one — the recorded
+        // width can never drift from the bytes a backend writes.
+        ClusterWriterFactory.validateDocBits(quantizationParams);
+
         if (vectors.size() == 0) {
+            ClusterANNStat.FLUSH_EMPTY_FIELDS.increment();
             ClusterANNFieldMeta.empty(
                 dimension,
                 metric,
@@ -366,23 +510,55 @@ public class KNN1030ClusterANNVectorsWriter extends KnnVectorsWriter {
             ? RotationScheme.HADAMARD
             : RotationScheme.forMetric(metric);
         final int rotationId = scheme.code();
+        final long tRotate0 = System.nanoTime();
         final Rotation rotation = RotationFormats.create(rotationId, dimension);
         final Optional<RotationRegion> rotationRegion = maybeWriteRotation(scheme, rotation);
+        ClusterANNStat.ROTATION_TIME_MS.record((System.nanoTime() - tRotate0) / 1_000_000);
         log.debug("field [{}]: rotationId={}", name, rotationId);
 
+        // Polled before each heavy phase so an aborted merge stops here instead of paying for the next phase; the
+        // phases poll again inside their own loops.
+        KnnMergeAbortChecker.ensureMergeNotAborted();
+        final long tCluster0 = System.nanoTime();
         final ClusteringResult clusters = ClusterBuilder.build(vectors, metric, executor);
+        final long clusterMs = (System.nanoTime() - tCluster0) / 1_000_000;
+        (isMerge ? ClusterANNStat.MERGE_CLUSTER_BUILD_TIME_MS : ClusterANNStat.FLUSH_CLUSTER_BUILD_TIME_MS).record(clusterMs);
+        recordClusteringStructure(clusters, vectors.size());
+        if (quantizationParams.encoding() == ClusterANNEncoding.DATA_BLIND_INT8) {
+            ClusterANNStat.INT8_ENCODE_COUNT.increment();
+        }
         log.debug("field [{}]: clustered into {} centroid(s)", name, clusters.numCentroids());
 
-        final PostingsRegions postings = new ClusterAnnPostingsWriter(
-            new ClusterWriterFactory(quantizationParams, dimension, metric, ioFetchBytes),
-            rotation
-        ).write(clap, clusters, vectors, metric);
+        KnnMergeAbortChecker.ensureMergeNotAborted();
+        final ClusterWriterFactory clusterWriterFactory = new ClusterWriterFactory(
+            quantizationParams,
+            dimension,
+            metric,
+            storageBlockBytes
+        );
+        final long tEncode0 = System.nanoTime();
+        final PostingsRegions postings;
+        try {
+            postings = new ClusterAnnPostingsWriter(clusterWriterFactory, rotation).write(clap, clusters, vectors, metric);
+        } catch (final MergePolicy.MergeAbortedException e) {
+            throw e; // a cancelled merge is not a quantization failure
+        } catch (final IOException | RuntimeException e) {
+            // The encode/quantize-and-write phase failed for this field; count it distinctly from the
+            // flush/merge-level error before letting the caller record that too and rethrow.
+            ClusterANNStat.QUANTIZATION_ERRORS.increment();
+            throw e;
+        }
+        final long encodeMs = (System.nanoTime() - tEncode0) / 1_000_000;
+        (isMerge ? ClusterANNStat.MERGE_ENCODE_TIME_MS : ClusterANNStat.FLUSH_ENCODE_TIME_MS).record(encodeMs);
 
+        KnnMergeAbortChecker.ensureMergeNotAborted();
+        final long tCentroid0 = System.nanoTime();
         final CentroidOffsets centroids = writeCentroids(clusters, rotation);
+        ClusterANNStat.CENTROID_WRITE_TIME_MS.record((System.nanoTime() - tCentroid0) / 1_000_000);
         final long clacLength = clac.getFilePointer() - centroids.clacOffset();
 
         final ClusterANNFieldMeta meta = new ClusterANNFieldMeta(
-            ClusterWriterFactory.vectorsPerBlock(quantizationParams, dimension, ioFetchBytes),
+            ClusterWriterFactory.vectorsPerBlock(quantizationParams, dimension, storageBlockBytes),
             dimension,
             vectors.size(),
             clusters.numCentroids(),
@@ -433,6 +609,16 @@ public class KNN1030ClusterANNVectorsWriter extends KnnVectorsWriter {
     private CentroidOffsets writeCentroids(final ClusteringResult clusters, final Rotation rotation) throws IOException {
         final CentroidData centroidData = new CentroidData(clusters.assignments(), clusters.centroids());
         return CentroidsWriter.write(clac, centroidData, rotation);
+    }
+
+    private static boolean isCosine(final FieldInfo fieldInfo) {
+        return fieldInfo.getVectorSimilarityFunction() == VectorSimilarityFunction.COSINE;
+    }
+
+    private static void normalizeInPlace(final List<float[]> vectors) {
+        for (final float[] vector : vectors) {
+            VectorUtil.l2normalize(vector, false); // a zero vector stays zero rather than failing the flush
+        }
     }
 
     /** A rotated field's {@code .clar} region: absolute offset and byte length. Absent for an unrotated field. */

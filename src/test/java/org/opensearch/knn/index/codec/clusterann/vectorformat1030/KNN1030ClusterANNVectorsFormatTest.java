@@ -8,7 +8,10 @@ package org.opensearch.knn.index.codec.clusterann.vectorformat1030;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
+import org.opensearch.knn.clusterann.format.QuantizationParams;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -40,6 +43,20 @@ class KNN1030ClusterANNVectorsFormatTest {
     void getMaxDimensions_returnsConfiguredLimit_independentOfField() {
         assertEquals(16000, format.getMaxDimensions("float_field"));
         assertEquals(16000, format.getMaxDimensions("some_other_field"));
+    }
+
+    @ParameterizedTest(name = "storageBlockBytes {0}")
+    @ValueSource(ints = { 0, -1 })
+    void constructor_throws_whenStorageBlockBytesIsNotPositive(int storageBlockBytes) {
+        IllegalArgumentException e = assertThrows(
+            IllegalArgumentException.class,
+            () -> new KNN1030ClusterANNVectorsFormat(
+                KNN1030ClusterANNVectorsFormat.FORMAT_NAME,
+                QuantizationParams.DEFAULT,
+                storageBlockBytes
+            )
+        );
+        assertEquals("storageBlockBytes must be positive, got: " + storageBlockBytes, e.getMessage());
     }
 
     @Test

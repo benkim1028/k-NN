@@ -65,11 +65,10 @@ public class KNN1030ClusterANNVectorsFormat extends KnnVectorsFormat {
     /** Field number that ends the entry list in the metadata file; no real field can have it. */
     static final int NO_MORE_FIELDS = -1;
 
-    /**
-     * Byte budget of one code block when none is given: the unit the reader fetches, which each field turns
-     * into a vector count of its own according to what its vectors cost.
-     */
-    static final int DEFAULT_IO_FETCH_BYTES = 32 * 1024;
+    private static final int ONE_KB = 1024;
+
+    /** Bytes the storage layer fetches in one block, which a field's layout sizes itself against on write. */
+    static final int DEFAULT_STORAGE_BLOCK_BYTES = 32 * ONE_KB;
 
     public static final int VERSION_START = 0;
     public static final int VERSION_CURRENT = VERSION_START;
@@ -83,8 +82,7 @@ public class KNN1030ClusterANNVectorsFormat extends KnnVectorsFormat {
     /** How this format's fields are quantized on write; chosen at index time and recorded per field in {@code .clam}. */
     private final QuantizationParams quantizationParams;
 
-    /** Recorded per field in {@code .clam}; the block layout resolves it to a vector count on both sides. */
-    private final int ioFetchBytes;
+    private final int storageBlockBytes;
 
     /**
      * SPI constructor: {@code KnnVectorsFormat.forName(FORMAT_NAME)} needs a public no-arg constructor to
@@ -108,31 +106,32 @@ public class KNN1030ClusterANNVectorsFormat extends KnnVectorsFormat {
     }
 
     /**
-     * Creates a new format instance with an explicit encoding.
+     * Creates a new format instance with an explicit encoding and the default storage block size
+     * ({@link #DEFAULT_STORAGE_BLOCK_BYTES}).
      *
      * @param name         the name that uniquely identifies this format; must match the name used on read
      * @param quantizationParams the quantization backend and bit width to encode fields with
      */
     public KNN1030ClusterANNVectorsFormat(final String name, final QuantizationParams quantizationParams) {
-        this(name, quantizationParams, DEFAULT_IO_FETCH_BYTES);
+        this(name, quantizationParams, DEFAULT_STORAGE_BLOCK_BYTES);
     }
 
     /**
-     * Creates a new format instance with an explicit encoding and block byte budget.
+     * Creates a new format instance with an explicit encoding and storage block size.
      *
-     * @param name         the name that uniquely identifies this format; must match the name used on read
+     * @param name               the name that uniquely identifies this format; must match the name used on read
      * @param quantizationParams the quantization backend and bit width to encode fields with
-     * @param ioFetchBytes the byte budget of one code block; each field fits as many whole vectors into a block
-     *     as the budget holds, so a wider field gets fewer vectors per block rather than a bigger block
-     * @throws IllegalArgumentException if {@code ioFetchBytes} is not positive
+     * @param storageBlockBytes  bytes the storage layer fetches in one block, which a field's layout sizes itself
+     *     against on write
+     * @throws IllegalArgumentException if {@code storageBlockBytes} is not positive
      */
-    public KNN1030ClusterANNVectorsFormat(final String name, final QuantizationParams quantizationParams, final int ioFetchBytes) {
+    public KNN1030ClusterANNVectorsFormat(final String name, final QuantizationParams quantizationParams, final int storageBlockBytes) {
         super(name);
-        if (ioFetchBytes <= 0) {
-            throw new IllegalArgumentException("ioFetchBytes must be positive, got: " + ioFetchBytes);
+        if (storageBlockBytes <= 0) {
+            throw new IllegalArgumentException("storageBlockBytes must be positive, got: " + storageBlockBytes);
         }
         this.quantizationParams = quantizationParams;
-        this.ioFetchBytes = ioFetchBytes;
+        this.storageBlockBytes = storageBlockBytes;
     }
 
     /**
@@ -145,7 +144,7 @@ public class KNN1030ClusterANNVectorsFormat extends KnnVectorsFormat {
      */
     @Override
     public KnnVectorsWriter fieldsWriter(final SegmentWriteState segmentWriteState) throws IOException {
-        return new KNN1030ClusterANNVectorsWriter(segmentWriteState, RAW_FLAT_VECTORS_FORMAT, quantizationParams, ioFetchBytes);
+        return new KNN1030ClusterANNVectorsWriter(segmentWriteState, RAW_FLAT_VECTORS_FORMAT, quantizationParams, storageBlockBytes);
     }
 
     /**

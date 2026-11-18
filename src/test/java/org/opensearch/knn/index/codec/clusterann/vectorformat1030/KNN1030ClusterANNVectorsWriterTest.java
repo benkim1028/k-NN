@@ -90,7 +90,7 @@ class KNN1030ClusterANNVectorsWriterTest {
             state,
             rawFormat,
             QuantizationParams.DEFAULT,
-            KNN1030ClusterANNVectorsFormat.DEFAULT_IO_FETCH_BYTES
+            KNN1030ClusterANNVectorsFormat.DEFAULT_STORAGE_BLOCK_BYTES
         );
     }
 
@@ -121,6 +121,18 @@ class KNN1030ClusterANNVectorsWriterTest {
     void flush_delegates() throws Exception {
         writer.flush(10, null);
         verify(raw).flush(10, null);
+    }
+
+    @Test
+    void constructor_withoutStorageBlockBytes_opensTheClusterFiles() throws Exception {
+        // Replace the setUp writer, whose cluster files already occupy the segment's names.
+        writer.close();
+        for (final String file : directory.listAll()) {
+            directory.deleteFile(file);
+        }
+        writer = new KNN1030ClusterANNVectorsWriter(state, rawFormat, QuantizationParams.DEFAULT);
+        writer.finish();
+        verify(raw).finish();
     }
 
     @Test
@@ -155,7 +167,7 @@ class KNN1030ClusterANNVectorsWriterTest {
                 state.segmentInfo.getId(),
                 state.segmentSuffix
             );
-            assertEquals(KNN1030ClusterANNVectorsFormat.DEFAULT_IO_FETCH_BYTES, meta.readVInt(), "segment-level block budget");
+            assertEquals(KNN1030ClusterANNVectorsFormat.DEFAULT_STORAGE_BLOCK_BYTES, meta.readVInt(), "segment-level block budget");
             assertEquals(KNN1030ClusterANNVectorsFormat.NO_MORE_FIELDS, meta.readInt(), "no field entries yet");
             CodecUtil.checkFooter(meta);
         }

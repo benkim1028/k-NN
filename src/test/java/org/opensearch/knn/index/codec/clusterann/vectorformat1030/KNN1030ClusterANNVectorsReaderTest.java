@@ -21,12 +21,16 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.AcceptDocs;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.tests.store.MockDirectoryWrapper;
+import org.apache.lucene.util.BitSetIterator;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.StringHelper;
 import org.apache.lucene.util.Version;
@@ -40,6 +44,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -70,7 +75,6 @@ class KNN1030ClusterANNVectorsReaderTest {
     private static final String SEGMENT = "_0";
     private static final int FIELD_NUMBER = 0;
     private static final int DIMENSION = 8;
-    private static final int IO_FETCH_BYTES = 32 * 1024;
     private static final int MAX_DOC = 100;
     private static final VectorSimilarityFunction SIMILARITY = VectorSimilarityFunction.EUCLIDEAN;
 
@@ -148,6 +152,14 @@ class KNN1030ClusterANNVectorsReaderTest {
     @Test
     void constructor_readsMetaFile_whenFieldIsEmpty() throws Exception {
         openReader(floatVectorField(DIMENSION, SIMILARITY), validEntry().vectorCount(0).centroidCount(0));
+    }
+
+    @Test
+    void constructor_throws_whenNonEmptyFieldHasNoCentroids() {
+        assertThrows(
+            CorruptIndexException.class,
+            () -> openReader(floatVectorField(DIMENSION, SIMILARITY), validEntry().vectorCount(1).centroidCount(0))
+        );
     }
 
     @Test
@@ -334,6 +346,67 @@ class KNN1030ClusterANNVectorsReaderTest {
         verify(raw, never()).getRandomVectorScorer(any(String.class), any(float[].class));
     }
 
+    @Test
+    void search_whenFilterBitsAreNull_thenUsesTheUnfilteredPath() throws Exception {
+        final int vectorCount = 4;
+        final KNN1030ClusterANNVectorsReader assignmentPoisoned = openReaderWithPoisonedAssignments(
+            floatVectorField(DIMENSION, SIMILARITY),
+            validEntry().vectorCount(vectorCount).centroidCount(3).clacCentroidsOffset((long) vectorCount * Integer.BYTES),
+            vectorCount
+        );
+        final KnnCollector collector = mock(KnnCollector.class);
+        // Null bits are how a match-all filter reaches a segment without deletions.
+        final AcceptDocs acceptDocs = AcceptDocs.fromLiveDocs(null, MAX_DOC);
+
+        assignmentPoisoned.search(FIELD, new float[DIMENSION], collector, acceptDocs);
+
+        verify(collector, atLeastOnce()).collect(anyInt(), anyFloat());
+        verify(raw, never()).getRandomVectorScorer(any(String.class), any(float[].class));
+    }
+
+    @Test
+    void search_whenFilterIsRestrictive_thenDoesNotProbeEveryVectorDocument() throws Exception {
+        final KNN1030ClusterANNVectorsReader largeSegment = openReader(
+            floatVectorField(DIMENSION, SIMILARITY),
+            validEntry().vectorCount(MAX_DOC).centroidCount(1).clusterSizes(1).clacCentroidsOffset((long) MAX_DOC * Integer.BYTES)
+        );
+        final FixedBitSet accepted = new FixedBitSet(MAX_DOC);
+        accepted.set(0);
+        final AtomicInteger documentProbes = new AtomicInteger();
+        final Bits countingBits = new Bits() {
+            @Override
+            public boolean get(int index) {
+                documentProbes.incrementAndGet();
+                return accepted.get(index);
+            }
+
+            @Override
+            public int length() {
+                return accepted.length();
+            }
+        };
+        final AcceptDocs acceptDocs = new AcceptDocs() {
+            @Override
+            public Bits bits() {
+                return countingBits;
+            }
+
+            @Override
+            public DocIdSetIterator iterator() {
+                return new BitSetIterator(accepted, accepted.cardinality());
+            }
+
+            @Override
+            public int cost() {
+                return accepted.cardinality();
+            }
+        };
+
+        largeSegment.search(FIELD, new float[DIMENSION], mock(KnnCollector.class), acceptDocs);
+
+        assertTrue(documentProbes.get() < 10, "restrictive planning probed " + documentProbes.get() + " documents");
+    }
+
     /**
      * A field with no ClusterANN data is not searchable, and the reader says so by leaving the collector alone
      * rather than by throwing: an empty field is a valid field, it just has no vectors to offer.
@@ -434,6 +507,17 @@ class KNN1030ClusterANNVectorsReaderTest {
         return openReader(info, entry, FIELD_NUMBER);
     }
 
+    private KNN1030ClusterANNVectorsReader openReaderWithPoisonedAssignments(
+        FieldInfo info,
+        ClusterANNFieldMetaEncoder entry,
+        int poisonedAssignmentCount
+    ) throws IOException {
+        final MockDirectoryWrapper directory = new MockDirectoryWrapper(new Random(), new ByteBuffersDirectory());
+        directory.setCheckIndexOnClose(false);
+        directories.add(directory);
+        return openReader(directory, info, entry, FIELD_NUMBER, poisonedAssignmentCount);
+    }
+
     /**
      * Builds a one-field segment whose metadata file holds {@code entry} under {@code entryFieldNumber}, then
      * opens a reader over it. The entry's field number is separate from the {@link FieldInfo}'s own so a case
@@ -460,6 +544,16 @@ class KNN1030ClusterANNVectorsReaderTest {
         ClusterANNFieldMetaEncoder entry,
         int entryFieldNumber
     ) throws IOException {
+        return openReader(directory, info, entry, entryFieldNumber, 0);
+    }
+
+    private KNN1030ClusterANNVectorsReader openReader(
+        Directory directory,
+        FieldInfo info,
+        ClusterANNFieldMetaEncoder entry,
+        int entryFieldNumber,
+        int poisonedAssignmentCount
+    ) throws IOException {
         final SegmentInfo segmentInfo = new SegmentInfo(
             directory,
             Version.LATEST,
@@ -483,7 +577,7 @@ class KNN1030ClusterANNVectorsReaderTest {
         // long enough to hold the regions the entry describes. Nothing here reads them — Clusters only holds them
         // and clones per access — so blank bytes are enough.
         writeBlank(state, KNN1030ClusterANNVectorsFormat.POSTINGS_EXTENSION);
-        writeBlank(state, KNN1030ClusterANNVectorsFormat.CENTROIDS_EXTENSION);
+        writeCentroids(state, poisonedAssignmentCount);
 
         // .clar exists only for a rotated field, which is what lets the unrotated cases assert the reader does not
         // go looking for it.
@@ -512,6 +606,22 @@ class KNN1030ClusterANNVectorsReaderTest {
         }
     }
 
+    private static void writeCentroids(SegmentReadState state, int poisonedAssignmentCount) throws IOException {
+        String name = IndexFileNames.segmentFileName(
+            state.segmentInfo.name,
+            state.segmentSuffix,
+            KNN1030ClusterANNVectorsFormat.CENTROIDS_EXTENSION
+        );
+        try (IndexOutput out = state.directory.createOutput(name, IOContext.DEFAULT)) {
+            for (int assignment = 0; assignment < poisonedAssignmentCount; assignment++) {
+                out.writeInt(Integer.MAX_VALUE);
+            }
+            int remainingBytes = DATA_FILE_BYTES - poisonedAssignmentCount * Integer.BYTES;
+            out.writeBytes(new byte[remainingBytes], 0, remainingBytes);
+            CodecUtil.writeFooter(out);
+        }
+    }
+
     private static void writeMeta(SegmentReadState state, ClusterANNFieldMetaEncoder entry, int entryFieldNumber) throws IOException {
         final String name = IndexFileNames.segmentFileName(
             state.segmentInfo.name,
@@ -527,7 +637,8 @@ class KNN1030ClusterANNVectorsReaderTest {
                 state.segmentInfo.getId(),
                 state.segmentSuffix
             );
-            out.writeVInt(IO_FETCH_BYTES);
+            // k-NN only: the segment-level block budget that follows the .clam header.
+            out.writeVInt(KNN1030ClusterANNVectorsFormat.DEFAULT_STORAGE_BLOCK_BYTES);
             out.writeInt(entryFieldNumber);
             entry.write(out);
             out.writeInt(-1);

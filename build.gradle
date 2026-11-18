@@ -611,6 +611,11 @@ tasks.register('clusterAnnTest', Test) {
     useJUnitPlatform()
     systemProperty 'tests.security.manager', 'false'
     include '**/clusterann/**'
+    // KnnMergeAbortChecker sits in Lucene's package to reach package-private merge state; its test is JUnit 5 too.
+    include '**/org/apache/lucene/index/KnnMergeAbortChecker*'
+    // The suite package holds the component test's records, not tests. Scenario has a suite() accessor, which the
+    // vintage engine would take for a JUnit 3 suite method and fail on.
+    exclude '**/clusterann/component/suite/**'
     // The OpenSearch build plugin points every Test task at build/testrun/<task>; the component test resolves its
     // suite file, baselines and corpus cache relative to the project root (same as in formats), so run from there.
     workingDir = projectDir
@@ -637,6 +642,7 @@ test {
     systemProperty "jdk.attach.allowAttachSelf", true
     exclude '**/*BT*'
     exclude '**/clusterann/**'
+    exclude '**/org/apache/lucene/index/KnnMergeAbortChecker*'
     if (Os.isFamily(Os.FAMILY_WINDOWS)) {
         // Add the paths of built JNI libraries and its dependent libraries to PATH variable in System variables
         environment('PATH', System.getenv('PATH') + ";$rootDir/jni/build/release" + ";$rootDir/src/main/resources/windowsDependencies")

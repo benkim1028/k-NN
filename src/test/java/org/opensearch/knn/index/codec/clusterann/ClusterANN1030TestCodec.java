@@ -33,6 +33,11 @@ public class ClusterANN1030TestCodec extends FilterCodec {
         this(QuantizationParams.of(ClusterANNEncoding.OPTIMIZED_SCALAR_QUANTIZATION, docBits));
     }
 
+    /** At an explicit backend and code width, which is how a scenario's {@code codec.params.quantization} reaches the format. */
+    public ClusterANN1030TestCodec(final ClusterANNEncoding encoding, final int docBits) {
+        this(QuantizationParams.of(encoding, docBits));
+    }
+
     /** At an explicit quantization. */
     public ClusterANN1030TestCodec(final QuantizationParams quantizationParams) {
         super(CODEC_NAME, new Lucene103Codec());

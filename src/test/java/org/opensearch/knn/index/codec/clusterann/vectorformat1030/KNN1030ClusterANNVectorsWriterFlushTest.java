@@ -5,11 +5,13 @@
 
 package org.opensearch.knn.index.codec.clusterann.vectorformat1030;
 
+import org.opensearch.knn.clusterann.read.block.scalar.ScalarEncoding;
 import org.apache.lucene.codecs.Codec;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.KnnFloatVectorField;
 import org.apache.lucene.document.NumericDocValuesField;
+import org.apache.lucene.index.CheckIndex;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.IndexWriter;
@@ -17,19 +19,29 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.SerialMergeScheduler;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
+import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.tests.store.BaseDirectoryWrapper;
 import org.apache.lucene.tests.util.LuceneTestCase;
+import org.apache.lucene.tests.util.TestUtil;
+import org.apache.lucene.util.FixedBitSet;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
+import org.opensearch.knn.clusterann.format.QuantizationParams;
 import org.opensearch.knn.index.codec.clusterann.ClusterANN1030TestCodec;
 
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Flush-path integration tests for {@link KNN1030ClusterANNVectorsWriter}. Unlike the component test (which
@@ -67,6 +79,11 @@ public class KNN1030ClusterANNVectorsWriterFlushTest extends LuceneTestCase {
 
                 final ClusterANNFieldMeta l2 = entries.get(l2Number);
                 assertEquals(DIMENSION, l2.dimension());
+                assertEquals(
+                    "the vectors per block the quantizer derived from the storage block is recorded",
+                    expectedBlockSize(),
+                    l2.blockSize()
+                );
                 assertEquals(NUM_DOCS, l2.vectorCount());
                 assertEquals(VectorSimilarityFunction.EUCLIDEAN, l2.similarityFunction());
                 assertTrue("below threshold clusters into a single centroid", l2.centroidCount() >= 1);
@@ -211,6 +228,151 @@ public class KNN1030ClusterANNVectorsWriterFlushTest extends LuceneTestCase {
         }
     }
 
+    public void testSearch_restrictiveFilterOutsideUnfilteredProbes_returnsKFilteredResults() throws Exception {
+        final int groupSize = 512;
+        final int groups = 16;
+        final int numDocs = groupSize * groups;
+        final int acceptedDocs = groupSize;
+        final int k = 5;
+
+        try (Directory dir = new ByteBuffersDirectory()) {
+            final IndexWriterConfig iwc = new IndexWriterConfig().setCodec(new ClusterANN1030TestCodec(4))
+                .setMergePolicy(NoMergePolicy.INSTANCE)
+                .setUseCompoundFile(false)
+                .setMaxBufferedDocs(numDocs + 1);
+            try (IndexWriter writer = new IndexWriter(dir, iwc)) {
+                for (int docId = 0; docId < numDocs; docId++) {
+                    final Document doc = new Document();
+                    doc.add(new KnnFloatVectorField(L2_FIELD, separatedVector(docId, groupSize), VectorSimilarityFunction.EUCLIDEAN));
+                    writer.addDocument(doc);
+                }
+                writer.commit();
+            }
+
+            try (DirectoryReader reader = DirectoryReader.open(dir)) {
+                final FixedBitSet accepted = new FixedBitSet(numDocs);
+                accepted.set(numDocs - acceptedDocs, numDocs);
+                final TopDocs hits = reader.leaves()
+                    .get(0)
+                    .reader()
+                    .searchNearestVectors(L2_FIELD, new float[DIMENSION], k, AcceptDocs.fromLiveDocs(accepted, numDocs), Integer.MAX_VALUE);
+
+                assertEquals(k, hits.scoreDocs.length);
+                final Set<Integer> expected = new HashSet<>();
+                for (int docId = numDocs - acceptedDocs; docId < numDocs - acceptedDocs + k; docId++) {
+                    expected.add(docId);
+                }
+                int recalled = 0;
+                for (var hit : hits.scoreDocs) {
+                    assertTrue("every result must satisfy the restrictive filter", hit.doc >= numDocs - acceptedDocs);
+                    if (expected.contains(hit.doc)) {
+                        recalled++;
+                    }
+                }
+                assertTrue("recall against brute force must be at least 0.6, got " + recalled + "/" + k, recalled >= 3);
+            }
+        }
+    }
+
+    public void testSearch_whenKCoversEveryAcceptedVector_returnsEveryAcceptedVector() throws Exception {
+        final int groupSize = 512;
+        final int groups = 16;
+        final int numDocs = groupSize * groups;
+        final int acceptedDocs = numDocs - 1;
+        final int k = acceptedDocs;
+
+        try (Directory dir = new ByteBuffersDirectory()) {
+            final IndexWriterConfig iwc = new IndexWriterConfig().setCodec(new ClusterANN1030TestCodec(4))
+                .setMergePolicy(NoMergePolicy.INSTANCE)
+                .setUseCompoundFile(false)
+                .setMaxBufferedDocs(numDocs + 1);
+            try (IndexWriter writer = new IndexWriter(dir, iwc)) {
+                for (int docId = 0; docId < numDocs; docId++) {
+                    final Document doc = new Document();
+                    doc.add(new KnnFloatVectorField(L2_FIELD, separatedVector(docId, groupSize), VectorSimilarityFunction.EUCLIDEAN));
+                    writer.addDocument(doc);
+                }
+                writer.commit();
+            }
+
+            try (DirectoryReader reader = DirectoryReader.open(dir)) {
+                final FixedBitSet accepted = new FixedBitSet(numDocs);
+                accepted.set(0, numDocs - 1);
+                final TopDocs hits = reader.leaves()
+                    .get(0)
+                    .reader()
+                    .searchNearestVectors(L2_FIELD, new float[DIMENSION], k, AcceptDocs.fromLiveDocs(accepted, numDocs), Integer.MAX_VALUE);
+
+                assertEquals("every accepted document must be returned", acceptedDocs, hits.scoreDocs.length);
+                for (var hit : hits.scoreDocs) {
+                    assertTrue("the excluded document must not be returned", accepted.get(hit.doc));
+                }
+            }
+        }
+    }
+
+    public void testSearch_filteredSearch_thenDirectoryCloseRunsCheckIndex() throws Exception {
+        final int numDocs = 128;
+        final int acceptedDocs = 32;
+        final int k = 5;
+
+        try (Directory dir = newDirectory()) {
+            final BaseDirectoryWrapper checkedDirectory = (BaseDirectoryWrapper) dir;
+            assertTrue("LuceneTestCase directory must run CheckIndex on close", checkedDirectory.getCheckIndexOnClose());
+            final IndexWriterConfig iwc = newIndexWriterConfig().setCodec(new ClusterANN1030TestCodec(4))
+                .setMergePolicy(NoMergePolicy.INSTANCE)
+                .setUseCompoundFile(false)
+                .setMaxBufferedDocs(numDocs + 1);
+            try (IndexWriter writer = new IndexWriter(dir, iwc)) {
+                for (int docId = 0; docId < numDocs; docId++) {
+                    final Document doc = new Document();
+                    doc.add(new KnnFloatVectorField(L2_FIELD, separatedVector(docId, acceptedDocs), VectorSimilarityFunction.EUCLIDEAN));
+                    writer.addDocument(doc);
+                }
+                writer.commit();
+            }
+
+            try (DirectoryReader reader = DirectoryReader.open(dir)) {
+                final FixedBitSet accepted = new FixedBitSet(numDocs);
+                accepted.set(numDocs - acceptedDocs, numDocs);
+                final TopDocs hits = reader.leaves()
+                    .get(0)
+                    .reader()
+                    .searchNearestVectors(
+                        L2_FIELD,
+                        separatedVector(numDocs - 1, acceptedDocs),
+                        k,
+                        AcceptDocs.fromLiveDocs(accepted, numDocs),
+                        Integer.MAX_VALUE
+                    );
+
+                assertEquals(k, hits.scoreDocs.length);
+                for (var hit : hits.scoreDocs) {
+                    assertTrue("every result must satisfy the restrictive filter", accepted.get(hit.doc));
+                }
+            }
+
+            // Run CheckIndex explicitly too, so its own report for the vector field is kept rather than discarded on a
+            // clean close.
+            final ByteArrayOutputStream checkIndexOutput = new ByteArrayOutputStream();
+            final CheckIndex.Status status = TestUtil.checkIndex(
+                dir,
+                CheckIndex.Level.MIN_LEVEL_FOR_INTEGRITY_CHECKS,
+                true,
+                false,
+                checkIndexOutput
+            );
+            final String report = checkIndexOutput.toString(StandardCharsets.UTF_8);
+            System.out.println("CheckIndex report for vector field " + L2_FIELD + ":\n" + report);
+            assertTrue(report, status.clean);
+            final CheckIndex.Status.VectorValuesStatus vectors = status.segmentInfos.get(0).vectorValuesStatus;
+            assertNull(report, vectors.error);
+            assertEquals(report, 1, vectors.totalKnnVectorFields);
+            assertEquals(report, numDocs, vectors.totalVectorValues);
+            assertTrue(report, report.contains("test: vectors"));
+        }
+    }
+
     private void indexField(final Directory dir, final boolean sorted, final String field, final VectorSimilarityFunction similarity)
         throws Exception {
         final Codec codec = new ClusterANN1030TestCodec();
@@ -313,7 +475,13 @@ public class KNN1030ClusterANNVectorsWriterFlushTest extends LuceneTestCase {
         }
     }
 
-    /** Parses the {@code .clam} frame the reader consumes: header, block size, field entries, terminator, footer. */
+    private static int expectedBlockSize() {
+        final ScalarEncoding encoding = ScalarEncoding.fromNumBits(QuantizationParams.DEFAULT.docBits());
+        final int bytesPerVector = 4 * Integer.BYTES + encoding.getDocPackedLength(encoding.getDiscreteDimensions(DIMENSION));
+        return KNN1030ClusterANNVectorsFormat.DEFAULT_STORAGE_BLOCK_BYTES / bytesPerVector;
+    }
+
+    /** Parses the {@code .clam} frame the reader consumes: header, field entries, terminator, footer. */
     private static Map<Integer, ClusterANNFieldMeta> readClam(final Directory dir, final String file) throws Exception {
         final Map<Integer, ClusterANNFieldMeta> entries = new HashMap<>();
         try (ChecksumIndexInput meta = dir.openChecksumInput(file)) {
@@ -325,7 +493,8 @@ public class KNN1030ClusterANNVectorsWriterFlushTest extends LuceneTestCase {
                 readSegmentId(dir, file),
                 ""
             );
-            final int ioFetchBytes = meta.readVInt();
+            // k-NN only: the segment-level block budget that follows the .clam header.
+            assertEquals(KNN1030ClusterANNVectorsFormat.DEFAULT_STORAGE_BLOCK_BYTES, meta.readVInt());
             for (int fieldNumber = meta.readInt(); fieldNumber != KNN1030ClusterANNVectorsFormat.NO_MORE_FIELDS; fieldNumber = meta
                 .readInt()) {
                 entries.put(fieldNumber, ClusterANNFieldMeta.read(meta));
@@ -354,6 +523,16 @@ public class KNN1030ClusterANNVectorsWriterFlushTest extends LuceneTestCase {
         final float[] vector = new float[DIMENSION];
         for (int i = 0; i < DIMENSION; i++) {
             vector[i] = (seed + 1) * 0.1f + i * 0.01f;
+        }
+        return vector;
+    }
+
+    private static float[] separatedVector(final int docId, final int groupSize) {
+        final int group = docId / groupSize;
+        final int position = docId % groupSize;
+        final float[] vector = new float[DIMENSION];
+        for (int dimension = 0; dimension < DIMENSION; dimension++) {
+            vector[dimension] = group * 100f + position * 0.01f + dimension * 0.001f;
         }
         return vector;
     }

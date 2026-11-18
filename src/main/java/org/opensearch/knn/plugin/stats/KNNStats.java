@@ -45,6 +45,9 @@ public class KNNStats {
         ClusterANNStat.CENTROID_KNEE_EARLY_STOP,
         ClusterANNStat.FILTER_ELIGIBLE_CLUSTERS,
         ClusterANNStat.FILTER_EXTENDED_PAST_MAX_PROBES,
+        ClusterANNStat.FILTER_SELECTIVITY_BPS,
+        ClusterANNStat.FILTER_PROBE_MULTIPLIER_BPS,
+        ClusterANNStat.EXACT_FALLBACK,
         ClusterANNStat.BLOCKS_FETCHED,
         ClusterANNStat.VECTORS_SCORED,
         ClusterANNStat.VECTORS_COLLECTED_PER_QUERY
@@ -117,8 +120,8 @@ public class KNNStats {
      * {@code clusterann_vectors_scored} that is the mean positions per scored block, for
      * {@code clusterann_probes_planned} the mean probes per leaf scan.
      *
-     * <p>Only the search-path metrics appear here. The flush/merge counters in {@link ClusterANNStat} have no
-     * call sites on this branch, so publishing them would report a permanent zero.
+     * <p>Only the search-path metrics appear here; the flush, merge and build metrics in {@link ClusterANNStat} are
+     * recorded by the codec writer but are not part of the query stats.
      */
     private Map<String, Object> createClusterANNQueryStatsMap() {
         Map<String, Object> statsMap = new HashMap<>();

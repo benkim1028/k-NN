@@ -5,16 +5,12 @@
 
 package org.opensearch.knn.index.codec.clusterann.vectorformat1030;
 
-import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
-import org.apache.lucene.codecs.lucene90.IndexedDISI;
-import org.opensearch.knn.clusterann.format.ClusterANNFormatConstants;
-import org.opensearch.knn.clusterann.read.block.scalar.datablind.JavaInt8ScoreComputer;
-import org.opensearch.knn.clusterann.read.block.scalar.JavaAdcScoreComputer;
-import org.opensearch.knn.clusterann.read.ScoreComputer;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
+import org.apache.lucene.codecs.lucene90.IndexedDISI;
+import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.index.FieldInfo;
@@ -32,9 +28,14 @@ import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.hnsw.OrdinalTranslatedKnnCollector;
+import org.opensearch.knn.clusterann.format.ClusterANNEncoding;
 import org.opensearch.knn.clusterann.format.ClusterANNFieldMeta;
 import org.opensearch.knn.clusterann.read.Clusters;
 import org.opensearch.knn.clusterann.read.ScanParams;
+import org.opensearch.knn.clusterann.read.ScoreComputer;
+import org.opensearch.knn.clusterann.read.ScoreComputerFactory;
+import org.opensearch.knn.clusterann.read.block.scalar.JavaAdcScoreComputer;
+import org.opensearch.knn.clusterann.read.block.scalar.datablind.JavaInt8ScoreComputer;
 import org.opensearch.knn.clusterann.read.orchestration.CentroidPlanner;
 import org.opensearch.knn.clusterann.read.orchestration.ClusterSearcher;
 import org.opensearch.knn.clusterann.read.orchestration.PlanParams;
@@ -80,12 +81,31 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
     private final IndexInput rotation;
 
     /**
-     * Creates a reader for a single segment.
+     * Creates a reader for a single segment that scores every field with the format's Java implementation.
      *
      * @param state    state describing the segment being read
      * @param rawFlatVectorsReader delegate reader that provides access to the raw vectors
      */
     public KNN1030ClusterANNVectorsReader(final SegmentReadState state, final FlatVectorsReader rawFlatVectorsReader) throws IOException {
+        this(state, rawFlatVectorsReader, ScoreComputerFactory.NONE);
+    }
+
+    /**
+     * Creates a reader for a single segment.
+     *
+     * <p>Once a field's metadata is read, {@code scoreComputerFactory} is asked for that field's
+     * {@link ScoreComputer}; {@code null} selects {@link JavaAdcScoreComputer}. The choice is made once per field here
+     * and holds for the life of the reader.
+     *
+     * @param state    state describing the segment being read
+     * @param rawFlatVectorsReader delegate reader that provides access to the raw vectors
+     * @param scoreComputerFactory supplies the computer each field is scored with
+     */
+    public KNN1030ClusterANNVectorsReader(
+        final SegmentReadState state,
+        final FlatVectorsReader rawFlatVectorsReader,
+        final ScoreComputerFactory scoreComputerFactory
+    ) throws IOException {
         this.rawFlatVectorsReader = rawFlatVectorsReader;
         this.segmentReadState = state;
         this.fields = new IntObjectHashMap<>();
@@ -109,11 +129,13 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                     state.segmentInfo.getId(),
                     state.segmentSuffix
                 );
-                int ioFetchBytes = meta.readVInt();
-                if (ioFetchBytes <= 0) {
-                    throw new CorruptIndexException("ioFetchBytes must be positive, got: " + ioFetchBytes, meta);
+                // k-NN only: the segment's block budget follows the header (see the writer). Blocks are sized by
+                // each field entry's vectorsPerBlock, so the value is only validated here.
+                final int storageBlockBytes = meta.readVInt();
+                if (storageBlockBytes <= 0) {
+                    throw new CorruptIndexException("storageBlockBytes must be positive, got: " + storageBlockBytes, meta);
                 }
-                readFieldMetadata(meta, ioFetchBytes);
+                readFieldMetadata(meta);
             } catch (Throwable exception) {
                 priorE = exception;
             } finally {
@@ -144,6 +166,7 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                 final int fieldNumber = field.key;
                 final ClusterANNFieldMeta fieldMeta = field.value;
                 final String suffix = String.join("-", String.valueOf(fieldNumber), segmentReadState.segmentSuffix);
+                final ScoreComputer computer = resolveScoreComputer(scoreComputerFactory, fieldNumber, fieldMeta);
                 clusters.put(
                     field.key,
                     new Clusters(
@@ -151,7 +174,7 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                         centroids.slice("centroids_" + suffix, fieldMeta.clacOffset(), fieldMeta.clacLength()),
                         rotationSlice(fieldMeta, suffix),
                         field.value,
-                        javaScoreComputer(fieldMeta)
+                        computer
                     )
                 );
             }
@@ -161,6 +184,44 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                 IOUtils.closeWhileHandlingException(this);
             }
         }
+    }
+
+    /**
+     * The computer one field is scored with: the factory's answer, or the format's Java implementation when the factory
+     * returns {@code null}. A supplied computer is logged at INFO so a segment's choice can be read off the log; the
+     * default stays at DEBUG.
+     */
+    private ScoreComputer resolveScoreComputer(
+        final ScoreComputerFactory factory,
+        final int fieldNumber,
+        final ClusterANNFieldMeta fieldMeta
+    ) {
+        final ClusterANNEncoding quantizer = ClusterANNEncoding.fromQuantizerId(fieldMeta.quantizerId());
+
+        final ScoreComputer supplied = factory.create(quantizer, fieldMeta);
+        if (supplied == null) {
+            final ScoreComputer fallback = quantizer == ClusterANNEncoding.DATA_BLIND_INT8
+                ? JavaInt8ScoreComputer.INSTANCE
+                : JavaAdcScoreComputer.INSTANCE;
+            log.debug(
+                "segment [{}] field [{}]: scoring {} {}-bit codes with {}",
+                segmentReadState.segmentInfo.name,
+                fieldNumber,
+                quantizer,
+                fieldMeta.docBits(),
+                fallback.getClass().getName()
+            );
+            return fallback;
+        }
+        log.info(
+            "segment [{}] field [{}]: scoring {} {}-bit codes with {}",
+            segmentReadState.segmentInfo.name,
+            fieldNumber,
+            quantizer,
+            fieldMeta.docBits(),
+            supplied.getClass().getName()
+        );
+        return supplied;
     }
 
     /**
@@ -247,29 +308,32 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
             throw new IllegalArgumentException("fieldName, query, knn collector and  vector cannot be null");
         }
 
-        Clusters fieldClusters = clusters(fieldName);
-        if (fieldClusters == null) {
-            return;
-        }
-
-        // One "query" is one leaf scan: a shard-level query over N segments records N of these, which is the unit
-        // the probe and cluster counts below are per.
         ClusterANNStat.QUERY_REQUESTS.increment();
-        if (acceptDocs.bits() != null) {
+        final boolean filtered = acceptDocs.bits() != null;
+        if (filtered) {
             ClusterANNStat.QUERY_WITH_FILTER_REQUESTS.increment();
         }
-        final long startNanos = System.nanoTime();
-
-        final OrdToDocDISIReaderConfiguration ordToDocConfig = fieldClusters.clusterMeta().ordToDoc();
-        final LongValues ordToDoc = ordToDoc(ordToDocConfig, postings);
-        final OrdinalTranslatedKnnCollector translatedKnnCollector = new OrdinalTranslatedKnnCollector(
-            knnCollector,
-            (ord) -> Math.toIntExact(ordToDoc.get(ord))
-        );
-        Bits acceptedOrds = buildAcceptedOrds(acceptDocs, ordToDoc, fieldClusters.numVectors());
-
+        final long tQuery0 = System.nanoTime();
         try {
-            int[] probes = CentroidPlanner.plan(
+            Clusters fieldClusters = clusters(fieldName);
+            if (fieldClusters == null) {
+                // No ClusterANN data for this field in this segment: the flat reader handles it as an exact scan.
+                // This path runs no IVF search, so it is NOT counted in the ClusterANN query-latency distribution
+                // (recording it would inject ~0µs samples and bias the avg/p50/p90/p99 downward).
+                ClusterANNStat.EXACT_FALLBACK.increment();
+                return;
+            }
+
+            final OrdToDocDISIReaderConfiguration ordToDocConfig = fieldClusters.clusterMeta().ordToDoc();
+            final LongValues ordToDoc = ordToDoc(ordToDocConfig, postings);
+            final OrdinalTranslatedKnnCollector translatedKnnCollector = new OrdinalTranslatedKnnCollector(
+                knnCollector,
+                (ord) -> Math.toIntExact(ordToDoc.get(ord))
+            );
+            final Bits acceptedOrds = buildAcceptedOrds(acceptDocs, ordToDoc, fieldClusters.numVectors());
+
+            // Like ordToDoc, the docs-with-field set sits at absolute offsets in the whole .clap.
+            final int[] probes = CentroidPlanner.plan(
                 fieldClusters,
                 query,
                 PlanParams.of(fieldClusters.numClusters()),
@@ -277,6 +341,19 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                 acceptDocs,
                 () -> IndexedDISI.asDocIndexIterator(ordToDocConfig.getIndexedDISI(postings))
             );
+
+            ClusterANNStat.PROBES_PLANNED.record(probes.length);
+            if (filtered) {
+                // FILTER_ELIGIBLE_CLUSTERS is recorded inside CentroidPlanner, where the true eligible-cluster
+                // count (acceptedCentroids.cardinality()) is known — probes.length here is only the planned
+                // probe count, already captured by PROBES_PLANNED above.
+                final int totalClusters = fieldClusters.numClusters();
+                if (totalClusters > 0) {
+                    final long selectivityBps = (acceptDocs.cost() * 10_000L) / Math.max(1, fieldClusters.numVectors());
+                    ClusterANNStat.FILTER_SELECTIVITY_BPS.record(selectivityBps);
+                    ClusterANNStat.FILTER_PROBE_MULTIPLIER_BPS.record((probes.length * 10_000L) / totalClusters);
+                }
+            }
 
             float[] scanQuery = new float[query.length];
             fieldClusters.rotation().rotate(query, scanQuery);
@@ -288,16 +365,17 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                 translatedKnnCollector,
                 acceptedOrds
             );
-
-            ClusterANNStat.PROBES_PLANNED.record(probes.length);
             ClusterANNStat.CLUSTERS_SCANNED.record(scanned);
-            // Probes the planner ranked that held nothing to scan; the gap between the two above.
-            ClusterANNStat.EMPTY_PROBES_SKIPPED.record(probes.length - scanned);
-        } catch (RuntimeException | IOException e) {
+            if (probes.length > scanned) {
+                ClusterANNStat.EMPTY_PROBES_SKIPPED.incrementBy(probes.length - scanned);
+            }
+            // Latency recorded only for a real IVF search (past the null-clusters guard), not the fallback path.
+            // Microseconds: per-segment IVF search is frequently sub-millisecond, so milliseconds would floor most
+            // queries to 0 and flatten the distribution.
+            ClusterANNStat.QUERY_LATENCY_US.record((System.nanoTime() - tQuery0) / 1_000);
+        } catch (final IOException | RuntimeException e) {
             ClusterANNStat.QUERY_ERRORS.increment();
             throw e;
-        } finally {
-            ClusterANNStat.QUERY_LATENCY_US.record((System.nanoTime() - startNanos) / 1000L);
         }
     }
 
@@ -338,6 +416,13 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
         throw new UnsupportedOperationException("Search on byte vector not supported with cluster ann");
     }
 
+    private static LongValues ordToDoc(final OrdToDocDISIReaderConfiguration config, final IndexInput postings) throws IOException {
+        if (config.isDense() || config.isEmpty()) {
+            return LongValues.IDENTITY;
+        }
+        return config.getDirectMonotonicReader(postings);
+    }
+
     /**
      * Closes this stream and releases any system resources associated
      * with it. If the stream is already closed then invoking this
@@ -356,7 +441,7 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
         IOUtils.close(rawFlatVectorsReader, postings, centroids, rotation);
     }
 
-    private void readFieldMetadata(ChecksumIndexInput meta, int ioFetchBytes) throws IOException {
+    private void readFieldMetadata(ChecksumIndexInput meta) throws IOException {
         for (int fieldNumber = meta.readInt(); fieldNumber != KNN1030ClusterANNVectorsFormat.NO_MORE_FIELDS; fieldNumber = meta.readInt()) {
             FieldInfo info = fieldInfos.fieldInfo(fieldNumber);
             if (info == null) {
@@ -416,19 +501,5 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
                 meta
             );
         }
-    }
-
-    /** The format's own computer for a field's quantizer; the SIMD seam is not wired in this build. */
-    private static ScoreComputer javaScoreComputer(final ClusterANNFieldMeta fieldMeta) {
-        return fieldMeta.quantizerId() == ClusterANNFormatConstants.QUANTIZER_DATA_BLIND_INT8
-            ? JavaInt8ScoreComputer.INSTANCE
-            : JavaAdcScoreComputer.INSTANCE;
-    }
-
-    private static LongValues ordToDoc(final OrdToDocDISIReaderConfiguration config, final IndexInput postings) throws IOException {
-        if (config.isDense() || config.isEmpty()) {
-            return LongValues.IDENTITY;
-        }
-        return config.getDirectMonotonicReader(postings);
     }
 }
