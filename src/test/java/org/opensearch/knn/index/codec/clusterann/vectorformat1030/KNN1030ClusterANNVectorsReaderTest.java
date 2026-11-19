@@ -37,6 +37,8 @@ import org.apache.lucene.util.Version;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.opensearch.knn.clusterann.read.ClusterANNFieldMetaEncoder;
 
 import java.io.IOException;
@@ -89,6 +91,8 @@ class KNN1030ClusterANNVectorsReaderTest {
 
     private final FlatVectorsReader raw = mock(FlatVectorsReader.class);
     private final List<Directory> directories = new ArrayList<>();
+    /** k-NN only: the segment-level block budget {@link #writeMeta} puts after the .clam header. */
+    private int metaBlockBudget = KNN1030ClusterANNVectorsFormat.DEFAULT_STORAGE_BLOCK_BYTES;
     private final List<KNN1030ClusterANNVectorsReader> readers = new ArrayList<>();
 
     private KNN1030ClusterANNVectorsReader reader;
@@ -227,6 +231,18 @@ class KNN1030ClusterANNVectorsReaderTest {
         );
         assertTrue(e.getMessage().contains("has " + (MAX_DOC + 1) + " vectors"), e.getMessage());
         assertTrue(e.getMessage().contains("only " + MAX_DOC + " documents"), e.getMessage());
+    }
+
+    /** k-NN only: a segment-level block budget that is not positive is a corrupt .clam, whatever the entries hold. */
+    @ParameterizedTest(name = "storageBlockBytes {0}")
+    @ValueSource(ints = { 0, -1 })
+    void constructor_throws_whenSegmentBlockBudgetIsNotPositive(final int blockBudget) {
+        metaBlockBudget = blockBudget;
+        final CorruptIndexException e = assertThrows(
+            CorruptIndexException.class,
+            () -> openReader(floatVectorField(DIMENSION, SIMILARITY), validEntry())
+        );
+        assertTrue(e.getMessage().contains("storageBlockBytes must be positive, got: " + blockBudget), e.getMessage());
     }
 
     /** A corrupt entry surfaces as itself, not as the footer failure that follows it. */
@@ -571,7 +587,7 @@ class KNN1030ClusterANNVectorsReaderTest {
         final FieldInfos fieldInfos = new FieldInfos(new FieldInfo[] { info });
         final SegmentReadState state = new SegmentReadState(directory, segmentInfo, fieldInfos, IOContext.DEFAULT);
 
-        writeMeta(state, entry, entryFieldNumber);
+        writeMeta(state, entry, entryFieldNumber, metaBlockBudget);
 
         // The reader slices each field's region out of these for any field that has clusters, so they have to be
         // long enough to hold the regions the entry describes. Nothing here reads them — Clusters only holds them
@@ -622,7 +638,8 @@ class KNN1030ClusterANNVectorsReaderTest {
         }
     }
 
-    private static void writeMeta(SegmentReadState state, ClusterANNFieldMetaEncoder entry, int entryFieldNumber) throws IOException {
+    private static void writeMeta(SegmentReadState state, ClusterANNFieldMetaEncoder entry, int entryFieldNumber, int blockBudget)
+        throws IOException {
         final String name = IndexFileNames.segmentFileName(
             state.segmentInfo.name,
             state.segmentSuffix,
@@ -638,7 +655,7 @@ class KNN1030ClusterANNVectorsReaderTest {
                 state.segmentSuffix
             );
             // k-NN only: the segment-level block budget that follows the .clam header.
-            out.writeVInt(KNN1030ClusterANNVectorsFormat.DEFAULT_STORAGE_BLOCK_BYTES);
+            out.writeVInt(blockBudget);
             out.writeInt(entryFieldNumber);
             entry.write(out);
             out.writeInt(-1);
