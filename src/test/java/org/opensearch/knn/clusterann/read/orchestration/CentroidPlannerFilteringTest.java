@@ -70,6 +70,8 @@ class CentroidPlannerFilteringTest {
 
     @AfterEach
     void tearDown() throws IOException {
+        KneeExperiment.reset();
+        ProbeCurveExperiment.reset();
         for (Directory directory : directories) {
             directory.close();
         }
@@ -480,6 +482,88 @@ class CentroidPlannerFilteringTest {
         int[] probes = CentroidPlanner.plan(gapField(1), new float[DIMENSION], PlanParams.of(KNEE_CENTROIDS));
 
         assertArrayEquals(IntStream.range(0, 31).toArray(), probes);
+    }
+
+    // ---------------------------------------------------------------- EXPERIMENT (do not merge): knee off, static m
+
+    /** Knee off, unfiltered: the same field the knee cuts at 31 plans its whole ceiling, ceil(3 x 11) = 33. */
+    @Test
+    void testPlan_whenTheKneeIsOff_thenPlansTheWholeCeiling() throws IOException {
+        long earlyStopsBefore = ClusterANNStat.CENTROID_KNEE_EARLY_STOP.getCount();
+        KneeExperiment.setEnabled(false);
+
+        int[] probes = CentroidPlanner.plan(gapField(1), new float[DIMENSION], PlanParams.of(KNEE_CENTROIDS));
+
+        assertArrayEquals(IntStream.range(0, 33).toArray(), probes);
+        assertEquals(0, ClusterANNStat.CENTROID_KNEE_EARLY_STOP.getCount() - earlyStopsBefore);
+    }
+
+    /** Knee off, filtered: the gap the knee cuts at 31 is kept, and the whole budget of 34 at s = 128/129 is planned. */
+    @Test
+    void testPlanFiltered_whenTheKneeIsOff_thenPlansTheWholeBudget() throws IOException {
+        FixedBitSet acceptedOrds = new FixedBitSet(KNEE_CENTROIDS);
+        acceptedOrds.set(0, KNEE_CENTROIDS - 1);
+        KneeExperiment.setEnabled(false);
+
+        assertArrayEquals(IntStream.range(0, 34).toArray(), planFiltered(gapField(1), acceptedOrds, K));
+        assertArrayEquals(IntStream.range(0, 34).toArray(), planFiltered(kneeField(15, 1), acceptedOrds, K));
+    }
+
+    /**
+     * Knee off with a static multiplier (coefficient 0, intercept 2): every selectivity plans the same ceil(2 x 11) = 22,
+     * unfiltered, at s = 128/129 and at s = 0.02, on a field the knee cuts at 15 inside that ceiling.
+     */
+    @Test
+    void testPlan_whenTheKneeIsOffAndTheMultiplierIsStatic_thenEverySelectivityPlansTheSameCeiling() throws IOException {
+        ProbeCurveExperiment.set(ProbeCurveExperiment.DEFAULT_CURVE.withCoefficient(0.0).withIntercept(2.0));
+        FixedBitSet dense = new FixedBitSet(KNEE_CENTROIDS);
+        dense.set(0, KNEE_CENTROIDS - 1);
+        FixedBitSet selective = firstVectorOfEachCluster(KNEE_CENTROIDS, SELECTIVE_CLUSTER_SIZE);
+
+        // Knee on: the same static ceiling is cut at the knee, so the knee-off assertions below are not vacuous.
+        assertArrayEquals(
+            IntStream.range(0, 15).toArray(),
+            CentroidPlanner.plan(kneeField(15, 1), new float[DIMENSION], PlanParams.of(KNEE_CENTROIDS))
+        );
+        assertArrayEquals(IntStream.range(0, 15).toArray(), planFiltered(kneeField(15, SELECTIVE_CLUSTER_SIZE), selective, K));
+
+        KneeExperiment.setEnabled(false);
+        assertArrayEquals(
+            IntStream.range(0, 22).toArray(),
+            CentroidPlanner.plan(kneeField(15, 1), new float[DIMENSION], PlanParams.of(KNEE_CENTROIDS))
+        );
+        assertArrayEquals(IntStream.range(0, 22).toArray(), planFiltered(kneeField(15, 1), dense, K));
+        assertArrayEquals(IntStream.range(0, 22).toArray(), planFiltered(kneeField(15, SELECTIVE_CLUSTER_SIZE), selective, K));
+    }
+
+    /** Knee off, static m = 1: the ceiling of 11 holds 11 accepted, so k = 150 still extends the plan to the 101 that hold it. */
+    @Test
+    void testPlanFiltered_whenTheKneeIsOffAndTheCeilingIsShortOfK_thenStillExtendsToHoldK() throws IOException {
+        long pastBudgetBefore = ClusterANNStat.FILTER_EXTENDED_PAST_MAX_PROBES.getCount();
+        KneeExperiment.setEnabled(false);
+        ProbeCurveExperiment.set(ProbeCurveExperiment.DEFAULT_CURVE.withCoefficient(0.0).withIntercept(1.0));
+
+        int[] probes = planFiltered(lineField(SELECTIVE_CLUSTER_SIZE), clumpedFarFromTheQuery(), 150);
+
+        assertArrayEquals(IntStream.range(0, 101).toArray(), probes);
+        assertEquals(1, ClusterANNStat.FILTER_EXTENDED_PAST_MAX_PROBES.getCount() - pastBudgetBefore);
+        assertArrayEquals(IntStream.range(0, 11).toArray(), planFiltered(lineField(SELECTIVE_CLUSTER_SIZE), clumpedFarFromTheQuery(), 5));
+    }
+
+    /** Knee back on: the shipped cut comes back. */
+    @Test
+    void testPlan_whenTheKneeIsTurnedBackOn_thenCutsAgain() throws IOException {
+        KneeExperiment.setEnabled(false);
+        assertArrayEquals(
+            IntStream.range(0, 33).toArray(),
+            CentroidPlanner.plan(gapField(1), new float[DIMENSION], PlanParams.of(KNEE_CENTROIDS))
+        );
+        KneeExperiment.setEnabled(true);
+
+        assertArrayEquals(
+            IntStream.range(0, 31).toArray(),
+            CentroidPlanner.plan(gapField(1), new float[DIMENSION], PlanParams.of(KNEE_CENTROIDS))
+        );
     }
 
     /** s = 128/129 (factor 3): the same gap, 4.3 tail mean gaps, cuts. */

@@ -26,6 +26,7 @@ import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.index.IndexModule;
+import org.opensearch.knn.clusterann.read.orchestration.KneeExperiment;
 import org.opensearch.knn.clusterann.read.orchestration.ProbeCurveExperiment;
 import org.opensearch.knn.index.engine.MemoryOptimizedSearchSupportSpec;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
@@ -601,6 +602,42 @@ public class KNNSettings {
     }
 
     /**
+     * EXPERIMENT (do not merge): static-multiplier sweep. Dynamic cluster setting that turns ClusterANN knee pruning on
+     * (the default, the shipped behaviour) or off. Set it transient: the base jar does not know the key.
+     */
+    public static final String KNN_CLUSTERANN_EXPERIMENT_KNEE_ENABLED = "knn.clusterann.experiment.knee_enabled";
+    public static final Setting<Boolean> KNN_CLUSTERANN_EXPERIMENT_KNEE_ENABLED_SETTING = Setting.boolSetting(
+        KNN_CLUSTERANN_EXPERIMENT_KNEE_ENABLED,
+        KneeExperiment.DEFAULT_ENABLED,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * EXPERIMENT (do not merge): static-multiplier sweep. Seeds the live knee switch from the node's settings and keeps
+     * it in step with every later cluster-settings update. Grouped consumer, like the probe curve's, so a caller whose
+     * {@link ClusterSettings} does not carry the key still initializes.
+     *
+     * @param clusterSettings the node's cluster settings
+     * @param nodeSettings the node's startup settings, which the switch is seeded from when the key is not registered
+     */
+    public static void registerKneeExperiment(final ClusterSettings clusterSettings, final Settings nodeSettings) {
+        final boolean registered = clusterSettings.get(
+            KNN_CLUSTERANN_EXPERIMENT_KNEE_ENABLED
+        ) == KNN_CLUSTERANN_EXPERIMENT_KNEE_ENABLED_SETTING;
+        KneeExperiment.setEnabled(
+            registered
+                ? clusterSettings.get(KNN_CLUSTERANN_EXPERIMENT_KNEE_ENABLED_SETTING)
+                : KNN_CLUSTERANN_EXPERIMENT_KNEE_ENABLED_SETTING.get(nodeSettings)
+        );
+        clusterSettings.addSettingsUpdateConsumer(
+            settings -> KneeExperiment.setEnabled(KNN_CLUSTERANN_EXPERIMENT_KNEE_ENABLED_SETTING.get(settings)),
+            List.of(KNN_CLUSTERANN_EXPERIMENT_KNEE_ENABLED_SETTING),
+            settings -> KNN_CLUSTERANN_EXPERIMENT_KNEE_ENABLED_SETTING.get(settings)
+        );
+    }
+
+    /**
      * Keystore settings for build service HTTP authorization
      */
     public static final Setting<SecureString> KNN_REMOTE_BUILD_SERVER_USERNAME_SETTING = SecureSetting.secureString(
@@ -871,7 +908,9 @@ public class KNNSettings {
             KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_INTERCEPT_SETTING,
             KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_COEFFICIENT_SETTING,
             KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_EXPONENT_SETTING,
-            KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_CAP_SETTING
+            KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_CAP_SETTING,
+            // EXPERIMENT (do not merge): static-multiplier sweep
+            KNN_CLUSTERANN_EXPERIMENT_KNEE_ENABLED_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
@@ -1084,6 +1123,8 @@ public class KNNSettings {
         setSettingsUpdateConsumers();
         // EXPERIMENT (do not merge): probe-budget retune.
         registerProbeCurveExperiment(clusterService.getClusterSettings(), clusterService.getSettings());
+        // EXPERIMENT (do not merge): static-multiplier sweep.
+        registerKneeExperiment(clusterService.getClusterSettings(), clusterService.getSettings());
     }
 
     public static ByteSizeValue parseknnMemoryCircuitBreakerValue(String sValue, String settingName) {

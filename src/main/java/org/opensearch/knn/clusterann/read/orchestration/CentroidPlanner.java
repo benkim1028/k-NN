@@ -37,7 +37,8 @@ import java.util.List;
  * {@link CentroidKneePruner} cuts what it should not. Filtered plans are cut too, with a selectivity-scaled knee
  * factor, but never short of {@code k} accepted vectors.
  *
- * <p>Stateless and thread-safe: the only cursor it uses is a private copy taken per call.
+ * <p>Stateless and thread-safe: the only cursor it uses is a private copy taken per call. EXPERIMENT (do not merge):
+ * plans also read the JVM-global {@link KneeExperiment} and {@link ProbeCurveExperiment} switches.
  */
 public final class CentroidPlanner {
 
@@ -233,7 +234,7 @@ public final class CentroidPlanner {
     }
 
     /**
-     * Drain the heap into ordinals, closest-first, cutting at the knee.
+     * Drain the heap into ordinals, closest-first, cutting at the knee unless {@link KneeExperiment} turns it off.
      *
      * @param selectivity fraction of vectors the filter accepts, which sets the knee factor; 1 when unfiltered
      * @param acceptedCountsPerCluster accepted vectors per cluster, or null when unfiltered
@@ -246,6 +247,10 @@ public final class CentroidPlanner {
         final int[] acceptedCountsPerCluster,
         final int k
     ) {
+        // EXPERIMENT (do not merge): knee off plans every cluster the ranking kept: the ceiling, or the nearest that hold k.
+        if (KneeExperiment.enabled() == false) {
+            return closestFirst(nearest);
+        }
         final int ranked = nearest.size();
         final int[] probes = new int[ranked];
         final float[] distances = new float[ranked];

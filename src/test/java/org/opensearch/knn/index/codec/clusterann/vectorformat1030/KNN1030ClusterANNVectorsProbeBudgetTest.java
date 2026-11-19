@@ -21,6 +21,7 @@ import org.apache.lucene.tests.store.BaseDirectoryWrapper;
 import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.FixedBitSet;
+import org.opensearch.knn.clusterann.read.orchestration.KneeExperiment;
 import org.opensearch.knn.clusterann.read.orchestration.ProbeCurveExperiment;
 import org.opensearch.knn.clusterann.stats.ClusterANNStat;
 import org.opensearch.knn.index.codec.clusterann.ClusterANN1030TestCodec;
@@ -175,6 +176,78 @@ public class KNN1030ClusterANNVectorsProbeBudgetTest extends LuceneTestCase {
                             + ")"
                     );
                 } finally {
+                    ProbeCurveExperiment.reset();
+                }
+            }
+        }
+    }
+
+    /**
+     * EXPERIMENT (do not merge): knee off and a static multiplier reach a real index. With the knee on the default curve
+     * plans at most ceil(3 x root); with it off every query plans exactly that. A static m (coefficient 0, intercept m)
+     * plans exactly ceil(m x root) unfiltered and on a selective filter alike.
+     */
+    public void testSearch_whenTheKneeIsOffAndTheMultiplierIsStatic_thenEveryQueryPlansTheStaticCeiling() throws Exception {
+        final float[][] vectors = vectors(NUM_DOCS, 42);
+        final float[][] queries = vectors(NUM_QUERIES, 7);
+        try (Directory dir = newDirectory()) {
+            assertTrue("CheckIndex on close", ((BaseDirectoryWrapper) dir).getCheckIndexOnClose());
+            final IndexWriterConfig iwc = new IndexWriterConfig().setCodec(new ClusterANN1030TestCodec(4))
+                .setMergePolicy(NoMergePolicy.INSTANCE)
+                .setUseCompoundFile(false)
+                .setMaxBufferedDocs(NUM_DOCS + 1)
+                .setRAMBufferSizeMB(IndexWriterConfig.DISABLE_AUTO_FLUSH);
+            final long centroidsBefore = ClusterANNStat.CENTROID_COUNT.getTotal();
+            try (IndexWriter writer = new IndexWriter(dir, iwc)) {
+                for (float[] v : vectors) {
+                    final Document doc = new Document();
+                    doc.add(new KnnFloatVectorField("v", v, VectorSimilarityFunction.EUCLIDEAN));
+                    writer.addDocument(doc);
+                }
+                writer.commit();
+            }
+            final long numClusters = ClusterANNStat.CENTROID_COUNT.getTotal() - centroidsBefore;
+            final int root = (int) Math.sqrt(numClusters);
+            try (DirectoryReader reader = DirectoryReader.open(dir)) {
+                assertEquals("one segment", 1, reader.leaves().size());
+                final LeafReader leaf = reader.leaves().get(0).reader();
+                final FixedBitSet selective = new FixedBitSet(NUM_DOCS);
+                for (int doc = 0; doc < NUM_DOCS; doc += 100) {
+                    selective.set(doc);
+                }
+                final FixedBitSet all = new FixedBitSet(NUM_DOCS);
+                all.set(0, NUM_DOCS);
+                final List<Set<Integer>> exactAll = exactTopKPerQuery(vectors, queries, all);
+                final List<Set<Integer>> exactSelective = exactTopKPerQuery(vectors, queries, selective);
+                try {
+                    final double[] kneeOn = plannedPerQuery(leaf, queries, null, exactAll);
+                    KneeExperiment.setEnabled(false);
+                    final double[] kneeOff = plannedPerQuery(leaf, queries, null, exactAll);
+                    assertEquals("knee off plans the whole ceil(3 x root)", Math.min(3 * root, numClusters), kneeOff[0], 0.0);
+                    assertTrue("the knee cuts some queries on this field: " + kneeOn[0], kneeOn[0] < kneeOff[0]);
+
+                    final StringBuilder line = new StringBuilder("static m, knee off: clusters " + numClusters + ", root " + root);
+                    for (int m : new int[] { 1, 2, 4 }) {
+                        ProbeCurveExperiment.set(ProbeCurveExperiment.DEFAULT_CURVE.withCoefficient(0.0).withIntercept(m));
+                        final double[] unfiltered = plannedPerQuery(leaf, queries, null, exactAll);
+                        final double[] filtered = plannedPerQuery(leaf, queries, selective, exactSelective);
+                        final long ceiling = Math.min((long) m * root, numClusters);
+                        assertEquals("static m = " + m + " unfiltered", ceiling, unfiltered[0], 0.0);
+                        assertEquals("static m = " + m + " filtered", ceiling, filtered[0], 0.0);
+                        line.append(", m=")
+                            .append(m)
+                            .append(" planned ")
+                            .append(unfiltered[0])
+                            .append("/")
+                            .append(filtered[0])
+                            .append(" recall ")
+                            .append(unfiltered[1])
+                            .append("/")
+                            .append(filtered[1]);
+                    }
+                    System.out.println(line + ", knee on default " + kneeOn[0] + " vs off " + kneeOff[0]);
+                } finally {
+                    KneeExperiment.reset();
                     ProbeCurveExperiment.reset();
                 }
             }
