@@ -58,8 +58,11 @@ public record PlanParams(int minProbes, int maxProbes) {
         return new PlanParams(minProbes, maxProbes);
     }
 
-    /** m(s) = min(32, 1 + 2 / s^SELECTIVITY_EXPONENT). */
+    /**
+     * m(s) = min(cap, intercept + coefficient / s^exponent). Shipped as min(32, 1 + 2 / s^SELECTIVITY_EXPONENT);
+     * EXPERIMENT (do not merge): read from the live {@link ProbeCurveExperiment} curve, whose defaults are those values.
+     */
     static double multiplier(double selectivity) {
-        return Math.min(CAP_MULTIPLIER, 1.0 + 2.0 / Math.pow(selectivity, SELECTIVITY_EXPONENT));
+        return ProbeCurveExperiment.current().multiplier(selectivity);
     }
 }

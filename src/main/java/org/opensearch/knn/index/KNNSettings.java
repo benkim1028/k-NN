@@ -16,6 +16,7 @@ import org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsRespons
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.Booleans;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.SecureSetting;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
@@ -25,6 +26,7 @@ import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.index.IndexModule;
+import org.opensearch.knn.clusterann.read.orchestration.ProbeCurveExperiment;
 import org.opensearch.knn.index.engine.MemoryOptimizedSearchSupportSpec;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManagerDto;
@@ -498,6 +500,107 @@ public class KNNSettings {
     );
 
     /**
+     * EXPERIMENT (do not merge): probe-budget retune. Dynamic cluster settings that replace the four constants of the
+     * ClusterANN probe ceiling m(s) = min(cap, intercept + coefficient / s^exponent), so one jar sweeps every curve.
+     * Each defaults to the shipped constant (1, 2, 1/3, 32). Set them transient: the base jar does not know the keys.
+     */
+    public static final String KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_INTERCEPT = "knn.clusterann.experiment.probe_curve_intercept";
+    public static final String KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_COEFFICIENT = "knn.clusterann.experiment.probe_curve_coefficient";
+    public static final String KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_EXPONENT = "knn.clusterann.experiment.probe_curve_exponent";
+    public static final String KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_CAP = "knn.clusterann.experiment.probe_curve_cap";
+
+    public static final Setting<Double> KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_INTERCEPT_SETTING = probeCurveSetting(
+        KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_INTERCEPT,
+        ProbeCurveExperiment.DEFAULT_INTERCEPT,
+        ProbeCurveExperiment.MIN_INTERCEPT,
+        ProbeCurveExperiment.MAX_INTERCEPT
+    );
+    public static final Setting<Double> KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_COEFFICIENT_SETTING = probeCurveSetting(
+        KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_COEFFICIENT,
+        ProbeCurveExperiment.DEFAULT_COEFFICIENT,
+        ProbeCurveExperiment.MIN_COEFFICIENT,
+        ProbeCurveExperiment.MAX_COEFFICIENT
+    );
+    public static final Setting<Double> KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_EXPONENT_SETTING = probeCurveSetting(
+        KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_EXPONENT,
+        ProbeCurveExperiment.DEFAULT_EXPONENT,
+        ProbeCurveExperiment.MIN_EXPONENT,
+        ProbeCurveExperiment.MAX_EXPONENT
+    );
+    public static final Setting<Double> KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_CAP_SETTING = probeCurveSetting(
+        KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_CAP,
+        ProbeCurveExperiment.DEFAULT_CAP,
+        ProbeCurveExperiment.MIN_CAP,
+        ProbeCurveExperiment.MAX_CAP
+    );
+
+    private static Setting<Double> probeCurveSetting(final String key, final double defaultValue, final double min, final double max) {
+        return new Setting<>(
+            key,
+            Double.toString(defaultValue),
+            value -> ProbeCurveExperiment.parse(value, key, min, max),
+            NodeScope,
+            Dynamic
+        );
+    }
+
+    private static final List<Setting<Double>> PROBE_CURVE_SETTINGS = List.of(
+        KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_INTERCEPT_SETTING,
+        KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_COEFFICIENT_SETTING,
+        KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_EXPONENT_SETTING,
+        KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_CAP_SETTING
+    );
+
+    /**
+     * EXPERIMENT (do not merge): probe-budget retune. The whole probe curve the given settings describe; a key they
+     * leave out takes its shipped default.
+     *
+     * @param settings the settings to read the four keys from
+     * @throws IllegalArgumentException if a key is set to anything but a finite number in its range
+     */
+    public static ProbeCurveExperiment.Curve probeCurve(final Settings settings) {
+        return new ProbeCurveExperiment.Curve(
+            KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_INTERCEPT_SETTING.get(settings),
+            KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_COEFFICIENT_SETTING.get(settings),
+            KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_EXPONENT_SETTING.get(settings),
+            KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_CAP_SETTING.get(settings)
+        );
+    }
+
+    /**
+     * EXPERIMENT (do not merge): probe-budget retune. Seeds the live probe curve from the node's settings and keeps it
+     * in step with every later cluster-settings update.
+     *
+     * <p>One grouped consumer over the four keys: an update that sets several of them publishes one whole curve, and
+     * its validator parses all four before anything is applied, so a bad value rejects the whole update and leaves the
+     * live curve as it was. The grouped overload also does not insist the keys are registered, so a caller whose
+     * {@link ClusterSettings} carries only its own settings (as some unit tests build) still initializes.
+     *
+     * @param clusterSettings the node's cluster settings
+     * @param nodeSettings the node's startup settings, which the curve is seeded from when the keys are not registered
+     */
+    public static void registerProbeCurveExperiment(final ClusterSettings clusterSettings, final Settings nodeSettings) {
+        // Seed from the live view when the keys are registered (it already holds any applied cluster setting), else
+        // from the node's startup settings.
+        final boolean registered = PROBE_CURVE_SETTINGS.stream().allMatch(setting -> clusterSettings.get(setting.getKey()) == setting);
+        ProbeCurveExperiment.set(
+            registered
+                ? new ProbeCurveExperiment.Curve(
+                    clusterSettings.get(KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_INTERCEPT_SETTING),
+                    clusterSettings.get(KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_COEFFICIENT_SETTING),
+                    clusterSettings.get(KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_EXPONENT_SETTING),
+                    clusterSettings.get(KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_CAP_SETTING)
+                )
+                : probeCurve(nodeSettings)
+        );
+        clusterSettings.addSettingsUpdateConsumer(
+            settings -> ProbeCurveExperiment.set(probeCurve(settings)),
+            PROBE_CURVE_SETTINGS,
+            KNNSettings::probeCurve
+        );
+    }
+
+    /**
      * Keystore settings for build service HTTP authorization
      */
     public static final Setting<SecureString> KNN_REMOTE_BUILD_SERVER_USERNAME_SETTING = SecureSetting.secureString(
@@ -763,7 +866,12 @@ public class KNNSettings {
             KNN_REMOTE_BUILD_CLIENT_TIMEOUT_SETTING,
             KNN_REMOTE_BUILD_SERVER_USERNAME_SETTING,
             KNN_REMOTE_BUILD_SERVER_PASSWORD_SETTING,
-            INDEX_KNN_FAISS_EFFICIENT_FILTER_DISABLE_EXACT_SEARCH_SETTING
+            INDEX_KNN_FAISS_EFFICIENT_FILTER_DISABLE_EXACT_SEARCH_SETTING,
+            // EXPERIMENT (do not merge): probe-budget retune
+            KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_INTERCEPT_SETTING,
+            KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_COEFFICIENT_SETTING,
+            KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_EXPONENT_SETTING,
+            KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_CAP_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
@@ -974,6 +1082,8 @@ public class KNNSettings {
         this.clusterService = clusterService;
         this.nodeCbAttribute = Optional.empty();
         setSettingsUpdateConsumers();
+        // EXPERIMENT (do not merge): probe-budget retune.
+        registerProbeCurveExperiment(clusterService.getClusterSettings(), clusterService.getSettings());
     }
 
     public static ByteSizeValue parseknnMemoryCircuitBreakerValue(String sValue, String settingName) {
