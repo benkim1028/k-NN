@@ -102,15 +102,30 @@ class PlanParamsTests {
 
     // ---------------------------------------------------------------- invariants
 
-    /** A plan names at least one cluster, so a floor below one describes nothing. */
+    /** A negative floor describes nothing. */
     @ParameterizedTest(name = "minProbes {0}")
-    @CsvSource({ "0", "-1", "-100" })
-    void testConstruction_whenTheFloorIsBelowOne_thenThrows(int minProbes) {
+    @CsvSource({ "-1", "-100" })
+    void testConstruction_whenTheFloorIsNegative_thenThrows(int minProbes) {
         // given / when
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> new PlanParams(minProbes, 10));
 
         // then
-        assertTrue(e.getMessage().contains("minProbes must be at least 1"), e.getMessage());
+        assertTrue(e.getMessage().contains("minProbes must be at least 0"), e.getMessage());
+    }
+
+    /**
+     * A segment's share of a shard plan may be empty, (0, 0), or have none of its clusters inside the shard's floor,
+     * (0, n): both are legitimate.
+     */
+    @ParameterizedTest(name = "({0}, {1})")
+    @CsvSource({ "0, 0", "0, 5" })
+    void testConstruction_whenTheFloorOrBothAreZero_thenAccepted(int minProbes, int maxProbes) {
+        // given / when
+        PlanParams params = new PlanParams(minProbes, maxProbes);
+
+        // then
+        assertEquals(minProbes, params.minProbes());
+        assertEquals(maxProbes, params.maxProbes());
     }
 
     /** A ceiling under the floor leaves no count that satisfies both, so it is rejected rather than silently resolved. */
