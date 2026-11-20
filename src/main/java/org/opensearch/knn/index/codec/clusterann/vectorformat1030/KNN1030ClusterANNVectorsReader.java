@@ -384,9 +384,10 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
     }
 
     /**
-     * The clusters to scan: a shard's plan when the collector carries one, which the reader scans exactly as given;
-     * otherwise this segment's own plan. Only a caller searching this reader without a shard plan (a direct
-     * {@code searchNearestVectors}, or a test) gets the per-segment plan.
+     * The clusters to scan. With a shard plan on the collector: this segment's own centroids re-ranked, its first
+     * {@code maxProbes_s} and nothing more, with no knee and no per-segment hold of {@code k} (the shard's cut did
+     * both). Otherwise this segment's own plan; only a caller searching this reader without a shard plan (a direct
+     * {@code searchNearestVectors}, or a test) gets that.
      */
     private int[] probes(final Clusters fieldClusters, final float[] query, final KnnCollector knnCollector, final AcceptDocs acceptDocs)
         throws IOException {
@@ -394,15 +395,18 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
             if (!planned.plannedFor(fieldClusters)) {
                 throw new IllegalArgumentException("shard plan was made for another segment or field than this one");
             }
-            final int[] probes = planned.probes();
-            for (final int probe : probes) {
-                if (probe < 0 || probe >= fieldClusters.numClusters()) {
-                    throw new IllegalArgumentException(
-                        "shard plan names cluster " + probe + ", outside [0, " + fieldClusters.numClusters() + ")"
-                    );
-                }
+            final PlanParams segmentParams = planned.segmentParams();
+            if (segmentParams.maxProbes() == 0) {
+                return new int[0];
             }
-            return probes;
+            // Scoring-time pruning hook: the scan may stop early within [segmentParams.minProbes(),
+            // segmentParams.maxProbes()], reading planned.shardParams() for the shard's bounds. Not implemented here.
+            return CentroidPlanner.planWithin(
+                fieldClusters,
+                query,
+                segmentParams,
+                FilterDigest.of(fieldClusters, acceptDocs, vectorDocsSupplier(fieldClusters))
+            );
         }
         // Like ordToDoc, the docs-with-field set sits at absolute offsets in the whole .clap.
         return CentroidPlanner.plan(
@@ -432,7 +436,8 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
         if (fieldClusters == null || fieldClusters.numClusters() == 0) {
             return null;
         }
-        return new ShardPlanner.Segment(fieldClusters, FilterDigest.of(fieldClusters, acceptDocs, vectorDocsSupplier(fieldClusters)));
+        final FilterDigest digest = FilterDigest.of(fieldClusters, acceptDocs, vectorDocsSupplier(fieldClusters));
+        return new ShardPlanner.Segment(fieldClusters, digest == null ? null : digest.recordEligible());
     }
 
     private Bits buildAcceptedOrds(AcceptDocs acceptDocs, LongValues ordToDoc, int numVectors) throws IOException {

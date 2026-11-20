@@ -15,8 +15,9 @@ package org.opensearch.knn.clusterann.read.orchestration;
  * <p>{@code maxProbes} is applied during the ranking sweep, as the capacity of the selection heap, so the clusters
  * beyond it are never ordered. {@code minProbes} is applied afterwards, as a floor on whatever the pruners left.
  *
- * @param minProbes fewest clusters a plan may name, unless the field has fewer non-empty clusters than this
- * @param maxProbes most clusters a plan may name; also the ranking sweep's heap capacity
+ * @param minProbes fewest clusters a plan may name, unless the field has fewer non-empty clusters than this; 0 only in
+ *     a segment's share of a shard plan
+ * @param maxProbes most clusters a plan may name; also the ranking sweep's heap capacity; 0 means probe nothing
  */
 public record PlanParams(int minProbes, int maxProbes) {
 
@@ -30,8 +31,10 @@ public record PlanParams(int minProbes, int maxProbes) {
     public static final int MIN_NPROBE = 10;
 
     public PlanParams {
-        if (minProbes < 1) {
-            throw new IllegalArgumentException("minProbes must be at least 1, got: " + minProbes);
+        // 0 is allowed for both: a shard plan gives a segment none of its clusters (maxProbes 0), or none inside the
+        // shard's floor (minProbes 0). A per-segment plan from of/forSelectivity is always at least 1.
+        if (minProbes < 0) {
+            throw new IllegalArgumentException("minProbes must be at least 0, got: " + minProbes);
         }
         if (maxProbes < minProbes) {
             throw new IllegalArgumentException("maxProbes=" + maxProbes + " is below minProbes=" + minProbes);

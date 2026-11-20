@@ -9,21 +9,27 @@ import org.opensearch.common.Nullable;
 import org.opensearch.knn.clusterann.read.Clusters;
 
 import java.io.IOException;
-import java.util.Arrays;
 import java.util.List;
 import java.util.PriorityQueue;
 
 /**
- * Plans one query for a whole shard: which clusters of which segment to visit.
+ * Plans one query for a whole shard: how many clusters each segment may probe.
  *
  * <p>Every segment's centroids are ranked against the query by the planner's own keys ({@link CentroidPlanner#rank}),
- * which are computed from each segment's full-precision, input-space centroids and the raw query, so they compare
- * across segments. The shard keeps the global top {@code X} of the merged ranking and hands each segment its own share,
- * closest first. Under a filter the global prefix grows until the shard, not each segment, holds {@code k} accepted
- * vectors; when the shard holds {@code k} or fewer, every eligible cluster is kept.
+ * computed from each segment's full-precision, input-space centroids and the raw query, so they compare across
+ * segments. The shard keeps the global top {@code X} of the merged ranking; under a filter the cut grows until the
+ * shard, not each segment, holds {@code k} accepted vectors, and when the shard holds {@code k} or fewer, every eligible
+ * cluster is kept.
+ *
+ * <p>The plan hands each segment two <b>counts</b>, never a distance threshold and never a list: {@code maxProbes_s},
+ * how many of its clusters fall inside the global cut, and {@code minProbes_s}, how many fall inside the global top
+ * {@code minProbes}, the shard floor. The segment re-ranks its own centroids with the same keys and the same filter
+ * eligibility ({@link CentroidPlanner#planWithin}); because the ranking is a total order (key, then ordinal), its first
+ * {@code maxProbes_s} are exactly the clusters counted here, ties included. A count cannot drift on ties or on float
+ * differences the way a threshold could.
  *
  * <p>{@code X} is set by a {@link Budget}. The shard's {@link PlanParams} come from the shard's total cluster count and
- * its filter selectivity, and travel with the plan so scoring-time pruning can read them.
+ * its filter selectivity.
  *
  * <p>Stateless and thread-safe.
  */
@@ -58,22 +64,27 @@ public final class ShardPlanner {
      *
      * @param params the shard's bounds: {@code maxProbes} is R, {@code minProbes} the shipped floor at the shard's
      *     cluster count; null only when the shard has no cluster at all
-     * @param probes per segment, in input order, the centroid ordinals to visit, closest first; empty for a segment
-     *     the shard gave nothing
+     * @param segmentParams per segment, in input order, {@code (minProbes_s, maxProbes_s)}; either may be 0
      * @param budget X: clusters the shard set out to keep before any filter hold or take-all
      * @param totalClusters clusters across every segment (C_total)
      * @param selectivity fraction of the shard's vectors the filter accepts; 1 when unfiltered
      */
-    public record Plan(@Nullable PlanParams params, int[][] probes, int budget, int totalClusters, double selectivity) {
-        /** Clusters the plan probes across the shard. */
+    public record Plan(@Nullable PlanParams params, PlanParams[] segmentParams, int budget, int totalClusters, double selectivity) {
+        /** Clusters the plan lets the shard probe: the sum of every segment's {@code maxProbes_s}. */
         public int probeCount() {
             int total = 0;
-            for (final int[] p : probes) {
-                total += p.length;
+            for (final PlanParams p : segmentParams) {
+                total += p.maxProbes();
             }
             return total;
         }
     }
+
+    /** A plan together with the shard's own ranking of each segment, for tests to compare segment re-ranks against. */
+    record Ranked(Plan plan, CentroidPlanner.Ranked[] rankings) {
+    }
+
+    private static final PlanParams NOTHING = new PlanParams(0, 0);
 
     private ShardPlanner() {}
 
@@ -104,6 +115,10 @@ public final class ShardPlanner {
      * @param budget how X is chosen
      */
     public static Plan plan(final List<Segment> segments, final float[] query, final int k, final Budget budget) throws IOException {
+        return planRanked(segments, query, k, budget).plan();
+    }
+
+    static Ranked planRanked(final List<Segment> segments, final float[] query, final int k, final Budget budget) throws IOException {
         final int n = segments.size();
         int totalClusters = 0;
         long vectors = 0;
@@ -119,10 +134,14 @@ public final class ShardPlanner {
                 accepted += segment.digest().accepted();
             }
         }
-        final int[][] probes = new int[n][];
+        final PlanParams[] segmentParams = new PlanParams[n];
+        final CentroidPlanner.Ranked[] ranked = new CentroidPlanner.Ranked[n];
         if (totalClusters == 0) {
-            Arrays.fill(probes, new int[0]);
-            return new Plan(null, probes, 0, 0, 1.0);
+            for (int s = 0; s < n; s++) {
+                segmentParams[s] = NOTHING;
+                ranked[s] = new CentroidPlanner.Ranked(new int[0], new float[0]);
+            }
+            return new Ranked(new Plan(null, segmentParams, 0, 0, 1.0), ranked);
         }
         final double selectivity = filtered ? (double) accepted / Math.max(1, vectors) : 1.0;
         final PlanParams params = shardParams(totalClusters, selectivity);
@@ -130,8 +149,7 @@ public final class ShardPlanner {
         final boolean takeAll = filtered && accepted <= k;
 
         // 1. Rank every segment. Each list is long enough to give the global top R, and under a filter holds k on its
-        // own, so the merged prefix can always be extended to hold k. Under H it also covers the segment's own plan.
-        final CentroidPlanner.Ranked[] ranked = new CentroidPlanner.Ranked[n];
+        // own, so the merged cut can always be extended to hold k. Under H it also covers the segment's own plan.
         for (int s = 0; s < n; s++) {
             final Segment segment = segments.get(s);
             final Clusters clusters = segment.clusters();
@@ -161,20 +179,26 @@ public final class ShardPlanner {
             x = Math.min(rule, perSegment);
         }
 
-        // 3. Merge the closest-first lists, keeping the global top X, extended until the shard holds k under a filter.
-        final int[] take = mergeTake(segments, ranked, takeAll ? Integer.MAX_VALUE : x, filtered ? k : 0);
-        for (int s = 0; s < n; s++) {
-            probes[s] = Arrays.copyOf(ranked[s].ords(), take[s]);
+        // 3. Count each segment's clusters inside the global cut (top X, extended to hold k under a filter), and inside
+        // the global top minProbes. Both are prefixes of one merged order, so minProbes_s <= maxProbes_s.
+        final int[] max = mergeTake(segments, ranked, takeAll ? Integer.MAX_VALUE : x, filtered ? k : 0);
+        int kept = 0;
+        for (final int m : max) {
+            kept += m;
         }
-        return new Plan(params, probes, x, totalClusters, selectivity);
+        final int[] min = mergeTake(segments, ranked, Math.min(params.minProbes(), kept), 0);
+        for (int s = 0; s < n; s++) {
+            segmentParams[s] = max[s] == 0 ? NOTHING : new PlanParams(min[s], max[s]);
+        }
+        return new Ranked(new Plan(params, segmentParams, x, totalClusters, selectivity), ranked);
     }
 
     /**
-     * How many of each segment's ranked clusters the merged prefix takes: at least {@code x} overall (or everything),
-     * and, with {@code holdK > 0}, as many more as it takes to hold {@code holdK} accepted vectors. Ties on the key go
-     * to the lower segment, then to the segment's own order, so the plan is deterministic.
+     * How many of each segment's ranked clusters the merged cut takes: at least {@code x} overall (or everything), and,
+     * with {@code holdK > 0}, as many more as it takes to hold {@code holdK} accepted vectors. Ties on the key go to the
+     * lower segment, then to the segment's own order, so the plan is deterministic.
      */
-    private static int[] mergeTake(final List<Segment> segments, final CentroidPlanner.Ranked[] ranked, final int x, final int holdK) {
+    static int[] mergeTake(final List<Segment> segments, final CentroidPlanner.Ranked[] ranked, final int x, final int holdK) {
         final int n = ranked.length;
         final int[] take = new int[n];
         final PriorityQueue<Integer> heads = new PriorityQueue<>(Math.max(1, n), (a, b) -> {

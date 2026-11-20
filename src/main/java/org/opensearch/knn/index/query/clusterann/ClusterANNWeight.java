@@ -27,6 +27,7 @@ import org.apache.lucene.search.Weight;
 import org.apache.lucene.search.knn.KnnSearchStrategy;
 import org.apache.lucene.util.ThreadInterruptedException;
 import org.opensearch.common.Nullable;
+import org.opensearch.knn.clusterann.read.orchestration.PlanParams;
 import org.opensearch.knn.clusterann.read.orchestration.ShardPlanStrategy;
 import org.opensearch.knn.clusterann.read.orchestration.ShardPlanner;
 import org.opensearch.knn.index.codec.clusterann.vectorformat1030.KNN1030ClusterANNVectorsReader;
@@ -53,11 +54,12 @@ import java.util.concurrent.FutureTask;
  * prunes from its first cluster instead of rediscovering the same bar.
  *
  * <p><b>The probe budget is planned per shard, not per segment.</b> The first segment asked for its hits plans the
- * whole shard ({@link ShardPlanner}): every segment's centroids ranked against the query together, the global top X
- * kept, and each segment handed its own share through the collector's search strategy ({@link ShardPlanStrategy}). The
- * reader then scans exactly that list. A segment the plan gave no cluster returns no hits; there is no fall back to
- * exact search for a segment that returns fewer than k, which a shard plan makes routine. Every other segment waits
- * for that one plan, which is the price of comparing their centroids.
+ * whole shard ({@link ShardPlanner}): every segment's centroids ranked against the query together and the global top X
+ * kept. Each segment is handed only counts, {@code (minProbes_s, maxProbes_s)}, through the collector's search strategy
+ * ({@link ShardPlanStrategy}); its reader re-ranks its own centroids and probes its first {@code maxProbes_s}. A segment
+ * given {@code maxProbes_s = 0} returns no hits and is not even searched; there is no fall back to exact search for a
+ * segment that returns fewer than k, which a shard plan makes routine. Every other segment waits for that one plan,
+ * which is the price of comparing their centroids.
  */
 final class ClusterANNWeight extends Weight {
 
@@ -232,10 +234,10 @@ final class ClusterANNWeight extends Weight {
         }
         final ShardPlanner.Plan plan = ShardPlanner.plan(segments, queryVector, candidateK, budget);
         for (int i = 0; i < planned.size(); i++) {
-            final int[] probes = plan.probes()[i];
-            final ShardPlanStrategy strategy = probes.length == 0
+            final PlanParams segmentParams = plan.segmentParams()[i];
+            final ShardPlanStrategy strategy = segmentParams.maxProbes() == 0
                 ? null
-                : new ShardPlanStrategy(segments.get(i).clusters(), probes, plan.params());
+                : new ShardPlanStrategy(segments.get(i).clusters(), segmentParams, plan.params());
             byOrd[planned.get(i).ord] = new LeafPlan(plannedAcceptDocs.get(i), strategy);
         }
         return new LeafPlans(byOrd, plan);

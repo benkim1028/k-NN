@@ -35,7 +35,8 @@ public record FilterDigest(FixedBitSet eligible, int[] acceptedPerCluster, int a
     /**
      * The digest of {@code acceptDocs} over {@code clusters}, or {@code null} when nothing is filtered out: a null
      * filter, or one with null {@link AcceptDocs#bits()}, which is how Lucene hands a segment without deletions a
-     * match-all filter. Records {@link ClusterANNStat#FILTER_ELIGIBLE_CLUSTERS}.
+     * match-all filter. Records nothing: a caller planning with it records {@link ClusterANNStat#FILTER_ELIGIBLE_CLUSTERS}
+     * (once per segment and query, so a segment re-ranking within a shard plan does not count it twice).
      *
      * @param vectorDocsSupplier a new iterator over the documents that have this vector field, exposing each one's
      *     vector ordinal; called only when the field is sparse
@@ -71,11 +72,16 @@ public record FilterDigest(FixedBitSet eligible, int[] acceptedPerCluster, int a
                 accepted++;
             }
         }
-        final int eligibleClusters = eligible.cardinality();
-        // True count of clusters containing at least one accepted doc (the filter's eligible set), recorded here
-        // where it is known; distinct from the planned probe count the reader records as PROBES_PLANNED.
+        return new FilterDigest(eligible, counts, accepted, eligible.cardinality());
+    }
+
+    /**
+     * Records {@link ClusterANNStat#FILTER_ELIGIBLE_CLUSTERS}, the true count of clusters holding an accepted doc;
+     * distinct from the planned probe count the reader records as PROBES_PLANNED.
+     */
+    public FilterDigest recordEligible() {
         ClusterANNStat.FILTER_ELIGIBLE_CLUSTERS.record(eligibleClusters);
-        return new FilterDigest(eligible, counts, accepted, eligibleClusters);
+        return this;
     }
 
     /** Fraction of the field's vectors the filter accepts. */

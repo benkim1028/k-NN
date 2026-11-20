@@ -72,14 +72,14 @@ public final class CentroidPlanner {
         AcceptDocs acceptDocs,
         IOSupplier<KnnVectorValues.DocIndexIterator> vectorDocsSupplier
     ) throws IOException {
-        if (clusters.numClusters() == 0) {
+        if (clusters.numClusters() == 0 || params.maxProbes() == 0) {
             return NO_PROBES;
         }
         if (acceptDocs == null || acceptDocs.bits() == null) {
             return plan(clusters, query, params);
         }
 
-        final FilterDigest digest = FilterDigest.of(clusters, acceptDocs, vectorDocsSupplier);
+        final FilterDigest digest = FilterDigest.of(clusters, acceptDocs, vectorDocsSupplier).recordEligible();
         final FixedBitSet acceptedCentroids = digest.eligible();
         final int[] acceptedCountsPerCluster = digest.acceptedPerCluster();
         final int acceptedVectors = digest.accepted();
@@ -113,10 +113,29 @@ public final class CentroidPlanner {
      * @return centroid ordinals to probe, ordered closest-first; empty if the field has no non-empty cluster
      */
     static int[] plan(Clusters clusters, float[] query, PlanParams params) throws IOException {
-        if (clusters.numClusters() == 0) {
+        if (clusters.numClusters() == 0 || params.maxProbes() == 0) {
             return NO_PROBES;
         }
         return closestFirstPruned(rank(clusters, query, params.maxProbes(), null, null, 0), params.minProbes(), 1.0, null, 0);
+    }
+
+    /**
+     * This segment's share of a shard plan: its own centroids re-ranked with the planner's keys and, under a filter,
+     * the filter's eligibility, keeping the first {@code segmentParams.maxProbes()}. No knee and no hold of {@code k}:
+     * the shard's cut already did both. The ranking is a total order (key, then ordinal, as {@link NeighborQueue}
+     * encodes it), so these are exactly the clusters the shard counted for this segment, ties included.
+     *
+     * <p>Scoring-time pruning hook: {@code segmentParams.minProbes()} is how many of the returned clusters fall inside
+     * the shard's floor. A scan may stop early only past that many; nothing here stops it.
+     *
+     * @param digest the filter's digest, or null when nothing is filtered out in this segment
+     * @return centroid ordinals, closest first; empty when {@code maxProbes} is 0 or nothing is eligible
+     */
+    public static int[] planWithin(Clusters clusters, float[] query, PlanParams segmentParams, FilterDigest digest) throws IOException {
+        if (clusters.numClusters() == 0 || segmentParams.maxProbes() == 0 || (digest != null && digest.eligibleClusters() == 0)) {
+            return NO_PROBES;
+        }
+        return closestFirst(rank(clusters, query, segmentParams.maxProbes(), digest == null ? null : digest.eligible(), null, 0));
     }
 
     /**
@@ -321,7 +340,8 @@ public final class CentroidPlanner {
             return probes;
         }
 
-        final int keep = Math.max(CentroidKneePruner.prune(distances, minProbes, selectivity), nearestHoldingK);
+        // The knee needs a floor of at least one; a 0 floor is only meaningful within a shard plan, which has no knee.
+        final int keep = Math.max(CentroidKneePruner.prune(distances, Math.max(1, minProbes), selectivity), nearestHoldingK);
         if (keep < ranked) {
             // The knee pruner cut the plan short: the adaptive early-stop fired for this query.
             ClusterANNStat.CENTROID_KNEE_EARLY_STOP.increment();
