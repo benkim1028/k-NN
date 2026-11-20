@@ -96,12 +96,17 @@ public final class ShardPlanner {
      * multiplier the shard-budget evaluation measured, so it is kept over the curve.
      */
     public static PlanParams shardParams(final int totalClusters, final double selectivity) {
+        return shardParams(totalClusters, selectivity, ShardPlanExperiment.current().minMultiplier());
+    }
+
+    /** As {@link #shardParams(int, double)}, with the floor on the multiplier given rather than read live. */
+    public static PlanParams shardParams(final int totalClusters, final double selectivity, final double minMultiplier) {
         if (totalClusters < 1) {
             throw new IllegalArgumentException("totalClusters must be at least 1, got: " + totalClusters);
         }
         final int root = (int) Math.sqrt(totalClusters);
-        // EXPERIMENT (do not merge): the floor is a live switch (default RULE_MIN_MULTIPLIER); m(s) is the live probe curve.
-        final double multiplier = Math.max(ShardPlanExperiment.current().minMultiplier(), PlanParams.multiplier(selectivity));
+        // EXPERIMENT (do not merge): the floor is a switch (default RULE_MIN_MULTIPLIER); m(s) is the live probe curve.
+        final double multiplier = Math.max(minMultiplier, PlanParams.multiplier(selectivity));
         final int maxProbes = Math.max(1, Math.min((int) Math.ceil(multiplier * root), totalClusters));
         final int minProbes = Math.min(PlanParams.forSelectivity(totalClusters, selectivity).minProbes(), maxProbes);
         return new PlanParams(minProbes, maxProbes);
@@ -119,7 +124,23 @@ public final class ShardPlanner {
         return planRanked(segments, query, k, budget).plan();
     }
 
+    /** As {@link #plan(List, float[], int, Budget)}, with the floor on the shard ceiling's multiplier given. */
+    public static Plan plan(final List<Segment> segments, final float[] query, final int k, final Budget budget, final double minMultiplier)
+        throws IOException {
+        return planRanked(segments, query, k, budget, minMultiplier).plan();
+    }
+
     static Ranked planRanked(final List<Segment> segments, final float[] query, final int k, final Budget budget) throws IOException {
+        return planRanked(segments, query, k, budget, ShardPlanExperiment.current().minMultiplier());
+    }
+
+    static Ranked planRanked(
+        final List<Segment> segments,
+        final float[] query,
+        final int k,
+        final Budget budget,
+        final double minMultiplier
+    ) throws IOException {
         final int n = segments.size();
         int totalClusters = 0;
         long vectors = 0;
@@ -145,7 +166,7 @@ public final class ShardPlanner {
             return new Ranked(new Plan(null, segmentParams, 0, 0, 1.0), ranked);
         }
         final double selectivity = filtered ? (double) accepted / Math.max(1, vectors) : 1.0;
-        final PlanParams params = shardParams(totalClusters, selectivity);
+        final PlanParams params = shardParams(totalClusters, selectivity, minMultiplier);
         final int rule = params.maxProbes();
         final boolean takeAll = filtered && accepted <= k;
 

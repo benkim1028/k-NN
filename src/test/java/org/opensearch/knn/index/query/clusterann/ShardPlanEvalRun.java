@@ -45,6 +45,7 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.opensearch.knn.clusterann.format.ClusterANNEncoding;
 import org.opensearch.knn.clusterann.read.Clusters;
 import org.opensearch.knn.clusterann.read.orchestration.FilterDigest;
+import org.opensearch.knn.clusterann.read.orchestration.ShardPlanExperiment;
 import org.opensearch.knn.clusterann.read.orchestration.ShardPlanner;
 import org.opensearch.knn.clusterann.stats.ClusterANNStat;
 import org.opensearch.knn.index.codec.clusterann.ClusterANN1030TestCodec;
@@ -120,6 +121,8 @@ class ShardPlanEvalRun {
     @Test
     @EnabledIfSystemProperty(named = "knn.shardPlanEval", matches = "true")
     void evaluate() throws Exception {
+        // EXPERIMENT (do not merge): H and R rows are labelled by budget alone, so the other switches must be the defaults.
+        ShardPlanExperiment.reset();
         final int[] segmentCounts = Arrays.stream(System.getProperty("knn.shardPlanEval.segments", "1,4,16").split(","))
             .mapToInt(s -> Integer.parseInt(s.trim()))
             .toArray();

@@ -28,6 +28,7 @@ import org.apache.lucene.search.knn.KnnSearchStrategy;
 import org.apache.lucene.util.ThreadInterruptedException;
 import org.opensearch.common.Nullable;
 import org.opensearch.knn.clusterann.read.orchestration.PlanParams;
+import org.opensearch.knn.clusterann.read.orchestration.ShardPlanExperiment;
 import org.opensearch.knn.clusterann.read.orchestration.ShardPlanStrategy;
 import org.opensearch.knn.clusterann.read.orchestration.ShardPlanner;
 import org.opensearch.knn.index.codec.clusterann.vectorformat1030.KNN1030ClusterANNVectorsReader;
@@ -73,13 +74,12 @@ final class ClusterANNWeight extends Weight {
 
     private final TimeLimitingKnnCollectorManager collectorManager;
 
-    private final ShardPlanner.Budget budget;
-
     /**
-     * EXPERIMENT (do not merge): off searches every segment without a shard plan, so each reader plans its own segment
-     * exactly as before shard planning (the knee and probe-curve switches then act on that per-segment plan).
+     * EXPERIMENT (do not merge): the query's shard-plan switches. Disabled searches every segment without a shard plan,
+     * so each reader plans its own segment exactly as before shard planning (the knee and probe-curve switches then act
+     * on that per-segment plan).
      */
-    private final boolean shardPlanEnabled;
+    private final ShardPlanExperiment.Config shardPlanConfig;
 
     /**
      * The shard plan, made once per top-level reader by whichever segment asks first; the others wait on it. Keyed on
@@ -103,8 +103,7 @@ final class ClusterANNWeight extends Weight {
         @Nullable final Weight filterWeight,
         final TimeLimitingKnnCollectorManager collectorManager,
         final float boost,
-        final ShardPlanner.Budget budget,
-        final boolean shardPlanEnabled
+        final ShardPlanExperiment.Config shardPlanConfig
     ) {
         super(query);
         this.field = field;
@@ -113,8 +112,7 @@ final class ClusterANNWeight extends Weight {
         this.filterWeight = filterWeight;
         this.collectorManager = collectorManager;
         this.boost = boost;
-        this.budget = budget;
-        this.shardPlanEnabled = shardPlanEnabled;
+        this.shardPlanConfig = shardPlanConfig;
     }
 
     @Override
@@ -154,7 +152,7 @@ final class ClusterANNWeight extends Weight {
             return cached;
         }
 
-        final LeafPlan plan = shardPlanEnabled ? shardPlan(context).forLeaf(context.ord) : null;
+        final LeafPlan plan = shardPlanConfig.enabled() ? shardPlan(context).forLeaf(context.ord) : null;
         // The plan's filter, already evaluated for this segment, so the scan does not evaluate it again.
         final AcceptDocs acceptDocs = plan == null ? acceptDocs(context) : plan.acceptDocs();
         TopDocs results = TopDocsCollector.EMPTY_TOPDOCS;
@@ -247,7 +245,13 @@ final class ClusterANNWeight extends Weight {
             planned.add(leaf);
             plannedAcceptDocs.add(acceptDocs);
         }
-        final ShardPlanner.Plan plan = ShardPlanner.plan(segments, queryVector, candidateK, budget);
+        final ShardPlanner.Plan plan = ShardPlanner.plan(
+            segments,
+            queryVector,
+            candidateK,
+            shardPlanConfig.budget(),
+            shardPlanConfig.minMultiplier()
+        );
         for (int i = 0; i < planned.size(); i++) {
             final PlanParams segmentParams = plan.segmentParams()[i];
             final ShardPlanStrategy strategy = segmentParams.maxProbes() == 0

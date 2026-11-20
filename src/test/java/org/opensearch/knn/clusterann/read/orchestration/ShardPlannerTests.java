@@ -298,7 +298,7 @@ class ShardPlannerTests {
             final int k = new int[] { 1, 10, 100 }[seed % 3];
             final List<ShardPlanner.Segment> segments = new ArrayList<>();
             final List<Fixture> fixtures = new ArrayList<>();
-            for (int s = 0; s < 1 + random.nextInt(5); s++) {
+            for (int s = 0, segmentCount = 1 + random.nextInt(5); s < segmentCount; s++) {
                 final Fixture f = fixture(
                     random,
                     similarity,
@@ -347,7 +347,7 @@ class ShardPlannerTests {
                 final int k = new int[] { 1, 10, 100 }[seed % 3];
                 final List<ShardPlanner.Segment> segments = new ArrayList<>();
                 final List<Fixture> fixtures = new ArrayList<>();
-                for (int s = 0; s < 1 + random.nextInt(5); s++) {
+                for (int s = 0, segmentCount = 1 + random.nextInt(5); s < segmentCount; s++) {
                     final Fixture f = fixture(
                         random,
                         VectorSimilarityFunction.EUCLIDEAN,

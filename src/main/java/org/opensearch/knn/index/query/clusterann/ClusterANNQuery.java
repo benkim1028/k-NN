@@ -75,12 +75,12 @@ public class ClusterANNQuery extends Query {
     private final int shardId;
 
     /**
-     * How many clusters the shard plan keeps, or null to read it from the live {@link ShardPlanExperiment} switches
-     * (EXPERIMENT, do not merge) when a weight is created, as every query built through the public constructor does.
-     * A non-null budget is for tests in this package.
+     * EXPERIMENT (do not merge): the shard-plan switches this query runs with, snapshotted from the live
+     * {@link ShardPlanExperiment} holder when the query is built, so its weight, plan and every segment see one setting
+     * and the query's identity (equals, hashCode, any cache keyed on them) reflects it. The package-private constructor
+     * may fix the budget, for tests.
      */
-    @Nullable
-    private final ShardPlanner.Budget budget;
+    private final ShardPlanExperiment.Config shardPlan;
 
     public ClusterANNQuery(
         final String field,
@@ -102,7 +102,8 @@ public class ClusterANNQuery extends Query {
         final int shardId,
         final ShardPlanner.Budget budget
     ) {
-        this.budget = budget;
+        final ShardPlanExperiment.Config live = ShardPlanExperiment.current();
+        this.shardPlan = budget == null ? live : new ShardPlanExperiment.Config(live.enabled(), budget, live.minMultiplier());
         this.field = field;
         this.queryVector = queryVector;
         this.candidateK = candidateK;
@@ -128,20 +129,7 @@ public class ClusterANNQuery extends Query {
             new ClusterANNCollectorManager(candidateK, parentsFilter, searcher),
             searcher.getTimeout()
         );
-        // EXPERIMENT (do not merge): the live shard-plan switches, read once per weight so every segment of this query sees
-        // one consistent setting.
-        final ShardPlanExperiment.Config live = ShardPlanExperiment.current();
-        return new ClusterANNWeight(
-            this,
-            field,
-            queryVector,
-            candidateK,
-            filterWeight(searcher),
-            collectorManager,
-            boost,
-            budget == null ? live.budget() : budget,
-            live.enabled()
-        );
+        return new ClusterANNWeight(this, field, queryVector, candidateK, filterWeight(searcher), collectorManager, boost, shardPlan);
     }
 
     /**
@@ -191,8 +179,8 @@ public class ClusterANNQuery extends Query {
             + filter
             + ", shardId="
             + shardId
-            + ", budget="
-            + budget
+            + ", shardPlan="
+            + shardPlan
             + "]";
     }
 
@@ -203,7 +191,7 @@ public class ClusterANNQuery extends Query {
         }
         final ClusterANNQuery o = (ClusterANNQuery) other;
         return candidateK == o.candidateK
-            && budget == o.budget
+            && Objects.equals(shardPlan, o.shardPlan)
             && Objects.equals(field, o.field)
             && Arrays.equals(queryVector, o.queryVector)
             && Objects.equals(filter, o.filter)
@@ -212,6 +200,6 @@ public class ClusterANNQuery extends Query {
 
     @Override
     public int hashCode() {
-        return Objects.hash(field, Arrays.hashCode(queryVector), candidateK, filter, parentsFilter, budget);
+        return Objects.hash(field, Arrays.hashCode(queryVector), candidateK, filter, parentsFilter, shardPlan);
     }
 }

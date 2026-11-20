@@ -414,6 +414,28 @@ public class ClusterANNShardPlanTests extends LuceneTestCase {
         }
     }
 
+    /**
+     * A query runs with the switches live when it was built, even if they change before its weight is made, and two
+     * queries built under different switches are not equal (so nothing keyed on the query mixes them).
+     */
+    public void testSwitch_whenChangedAfterTheQueryIsBuilt_thenTheQueryKeepsItsOwn() throws IOException {
+        final LeafReaderContext leaf = reader.leaves().get(0);
+        try {
+            ShardPlanExperiment.set(new ShardPlanExperiment.Config(true, ShardPlanner.Budget.RULE, 8.0));
+            final ClusterANNQuery rule = new ClusterANNQuery(FIELD, query(13), K, null, null, 0);
+            ShardPlanExperiment.set(new ShardPlanExperiment.Config(false, ShardPlanner.Budget.CAPPED, 0.0));
+            final ClusterANNQuery off = new ClusterANNQuery(FIELD, query(13), K, null, null, 0);
+            assertNotEquals(rule, off);
+
+            final ClusterANNWeight weight = (ClusterANNWeight) searcher.createWeight(searcher.rewrite(rule), ScoreMode.COMPLETE, 1f);
+            final ShardPlanner.Plan plan = weight.shardPlan(leaf).plan();
+            assertEquals(ShardPlanner.shardParams(plan.totalClusters(), 1.0, 8.0), plan.params());
+            assertEquals(plan.params().maxProbes(), plan.budget());
+        } finally {
+            ShardPlanExperiment.reset();
+        }
+    }
+
     private ClusterANNWeight liveWeight(final float[] query) throws IOException {
         final ClusterANNQuery q = new ClusterANNQuery(FIELD, query, K, null, null, 0);
         return (ClusterANNWeight) searcher.createWeight(searcher.rewrite(q), ScoreMode.COMPLETE, 1f);
