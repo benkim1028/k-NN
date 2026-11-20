@@ -217,6 +217,10 @@ public final class CentroidPlanner {
         final PlanParams params = PlanParams.of(clusters.numClusters());
         if (digest == null) {
             final int length = Math.min(params.maxProbes(), ranked.size());
+            // EXPERIMENT (do not merge): knee off, the segment's own plan is its whole ceiling, as plan() gives.
+            if (!KneeExperiment.enabled()) {
+                return length;
+            }
             return CentroidKneePruner.prune(Arrays.copyOf(ranked.keys(), length), params.minProbes(), 1.0);
         }
         if (digest.eligibleClusters() == 0) {
@@ -227,7 +231,8 @@ public final class CentroidPlanner {
         }
         final int holding = holdingK(ranked.ords(), 0, digest.acceptedPerCluster(), k);
         final int length = Math.max(Math.min(segmentRankCap(clusters, digest, k), ranked.size()), holding);
-        if (holding == length) {
+        // EXPERIMENT (do not merge): knee off, the ceiling or the nearest that hold k, as plan() gives.
+        if (holding == length || !KneeExperiment.enabled()) {
             return length;
         }
         final double selectivity = digest.selectivity(clusters.numVectors());

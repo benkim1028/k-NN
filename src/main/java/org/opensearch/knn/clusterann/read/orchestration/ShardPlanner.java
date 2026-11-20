@@ -100,7 +100,8 @@ public final class ShardPlanner {
             throw new IllegalArgumentException("totalClusters must be at least 1, got: " + totalClusters);
         }
         final int root = (int) Math.sqrt(totalClusters);
-        final double multiplier = Math.max(RULE_MIN_MULTIPLIER, PlanParams.multiplier(selectivity));
+        // EXPERIMENT (do not merge): the floor is a live switch (default RULE_MIN_MULTIPLIER); m(s) is the live probe curve.
+        final double multiplier = Math.max(ShardPlanExperiment.current().minMultiplier(), PlanParams.multiplier(selectivity));
         final int maxProbes = Math.max(1, Math.min((int) Math.ceil(multiplier * root), totalClusters));
         final int minProbes = Math.min(PlanParams.forSelectivity(totalClusters, selectivity).minProbes(), maxProbes);
         return new PlanParams(minProbes, maxProbes);

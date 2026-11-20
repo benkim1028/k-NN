@@ -76,6 +76,12 @@ final class ClusterANNWeight extends Weight {
     private final ShardPlanner.Budget budget;
 
     /**
+     * EXPERIMENT (do not merge): off searches every segment without a shard plan, so each reader plans its own segment
+     * exactly as before shard planning (the knee and probe-curve switches then act on that per-segment plan).
+     */
+    private final boolean shardPlanEnabled;
+
+    /**
      * The shard plan, made once per top-level reader by whichever segment asks first; the others wait on it. Keyed on
      * the top-level context so a weight is never handed a plan made for another reader's leaves.
      */
@@ -97,7 +103,8 @@ final class ClusterANNWeight extends Weight {
         @Nullable final Weight filterWeight,
         final TimeLimitingKnnCollectorManager collectorManager,
         final float boost,
-        final ShardPlanner.Budget budget
+        final ShardPlanner.Budget budget,
+        final boolean shardPlanEnabled
     ) {
         super(query);
         this.field = field;
@@ -107,6 +114,7 @@ final class ClusterANNWeight extends Weight {
         this.collectorManager = collectorManager;
         this.boost = boost;
         this.budget = budget;
+        this.shardPlanEnabled = shardPlanEnabled;
     }
 
     @Override
@@ -146,7 +154,7 @@ final class ClusterANNWeight extends Weight {
             return cached;
         }
 
-        final LeafPlan plan = shardPlan(context).forLeaf(context.ord);
+        final LeafPlan plan = shardPlanEnabled ? shardPlan(context).forLeaf(context.ord) : null;
         // The plan's filter, already evaluated for this segment, so the scan does not evaluate it again.
         final AcceptDocs acceptDocs = plan == null ? acceptDocs(context) : plan.acceptDocs();
         TopDocs results = TopDocsCollector.EMPTY_TOPDOCS;

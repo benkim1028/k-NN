@@ -36,8 +36,12 @@ import org.opensearch.knn.clusterann.read.Clusters;
 import org.opensearch.knn.clusterann.read.ScanParams;
 import org.opensearch.knn.clusterann.read.orchestration.CentroidPlanner;
 import org.opensearch.knn.clusterann.read.orchestration.ClusterSearcher;
+import org.opensearch.knn.clusterann.read.orchestration.EarlyStopExperiment;
+import org.opensearch.knn.clusterann.read.orchestration.EarlyStopParams;
 import org.opensearch.knn.clusterann.read.orchestration.FilterDigest;
 import org.opensearch.knn.clusterann.read.orchestration.PlanParams;
+import org.opensearch.knn.clusterann.read.orchestration.ProbeCurveExperiment;
+import org.opensearch.knn.clusterann.read.orchestration.ShardPlanExperiment;
 import org.opensearch.knn.clusterann.read.orchestration.ShardPlanStrategy;
 import org.opensearch.knn.clusterann.read.orchestration.ShardPlanner;
 import org.opensearch.knn.clusterann.stats.ClusterANNStat;
@@ -324,6 +328,95 @@ public class ClusterANNShardPlanTests extends LuceneTestCase {
         public int hashCode() {
             return classHash();
         }
+    }
+
+    // ---------------------------------------------------------------- EXPERIMENT switches (do not merge)
+
+    /**
+     * Shard plan off: every segment is searched without a plan, so the far segment is searched too, and the hits are
+     * exactly the pre-shard-plan path's (the reader planning each segment itself).
+     */
+    public void testSwitch_whenShardPlanOff_thenPerSegmentPathExactly() throws IOException {
+        ShardPlanExperiment.set(new ShardPlanExperiment.Config(false, ShardPlanner.Budget.RULE, 8.0));
+        try {
+            for (int q = 0; q < 10; q++) {
+                for (final Query filter : new Query[] { null, new TermQuery(new Term(PARITY, "even")) }) {
+                    final long requests = ClusterANNStat.QUERY_REQUESTS.getTotal();
+                    final TopDocs off = searcher.search(new ClusterANNQuery(FIELD, query(200 + q), K, filter, null, 0), K);
+                    assertEquals("every segment searched", SEGMENT_SIZES.length, ClusterANNStat.QUERY_REQUESTS.getTotal() - requests);
+                    final TopDocs today = searcher.search(new ShardPlanEvalRun.TodayQuery(FIELD, query(200 + q), K, filter), K);
+                    assertTrue("query " + q + " filter " + filter + " returned hits", today.scoreDocs.length > 0);
+                    assertSameHits("query " + q, today, off);
+                }
+            }
+        } finally {
+            ShardPlanExperiment.reset();
+        }
+    }
+
+    /** The live budget and floor reach a query built through the public constructor, read when its weight is made. */
+    public void testSwitch_whenBudgetAndFloorAreSet_thenTheWeightPlansWithThem() throws IOException {
+        final LeafReaderContext leaf = reader.leaves().get(0);
+        try {
+            ShardPlanExperiment.set(new ShardPlanExperiment.Config(true, ShardPlanner.Budget.RULE, 8.0));
+            final ShardPlanner.Plan rule = liveWeight(query(9)).shardPlan(leaf).plan();
+            assertEquals(rule.params().maxProbes(), rule.budget());
+            assertEquals(rule.params().maxProbes(), rule.probeCount());
+
+            ShardPlanExperiment.set(new ShardPlanExperiment.Config(true, ShardPlanner.Budget.RULE, 0.0));
+            ProbeCurveExperiment.set(ProbeCurveExperiment.DEFAULT_CURVE.withIntercept(1.0).withCoefficient(0.0));
+            final ShardPlanner.Plan staticOne = liveWeight(query(9)).shardPlan(leaf).plan();
+            assertEquals((int) Math.sqrt(staticOne.totalClusters()), staticOne.params().maxProbes());
+            assertEquals(staticOne.params().maxProbes(), staticOne.probeCount());
+
+            ShardPlanExperiment.reset();
+            ProbeCurveExperiment.reset();
+            final ShardPlanner.Plan capped = liveWeight(query(9)).shardPlan(leaf).plan();
+            assertTrue(capped.budget() <= capped.params().maxProbes());
+            assertEquals(ShardPlanner.shardParams(capped.totalClusters(), 1.0), capped.params());
+        } finally {
+            ShardPlanExperiment.reset();
+            ProbeCurveExperiment.reset();
+        }
+    }
+
+    /**
+     * The scan early stop acts on the shard-plan path: on, a segment's scan stops short of its maxProbes_s; off (the
+     * default, the baseline's setting), every probe the plan gives is scanned and no stop is recorded.
+     */
+    public void testSwitch_whenEarlyStop_thenTheShardPlanScanHonoursIt() throws IOException {
+        ShardPlanExperiment.set(new ShardPlanExperiment.Config(true, ShardPlanner.Budget.RULE, 8.0));
+        try {
+            final long stopsOff = ClusterANNStat.SCAN_EARLY_STOP.getTotal();
+            final long scannedOff = ClusterANNStat.CLUSTERS_SCANNED.getTotal();
+            final long plannedOff = ClusterANNStat.PROBES_PLANNED.getTotal();
+            searcher.search(new ClusterANNQuery(FIELD, query(11), K, null, null, 0), K);
+            assertEquals("off: no stop", stopsOff, ClusterANNStat.SCAN_EARLY_STOP.getTotal());
+            assertEquals(
+                "off: every planned probe scanned",
+                ClusterANNStat.PROBES_PLANNED.getTotal() - plannedOff,
+                ClusterANNStat.CLUSTERS_SCANNED.getTotal() - scannedOff
+            );
+
+            EarlyStopExperiment.set(new EarlyStopParams(1, K, 0));
+            final long stopsOn = ClusterANNStat.SCAN_EARLY_STOP.getTotal();
+            final long scannedOn = ClusterANNStat.CLUSTERS_SCANNED.getTotal();
+            final long plannedOn = ClusterANNStat.PROBES_PLANNED.getTotal();
+            searcher.search(new ClusterANNQuery(FIELD, query(11), K, null, null, 0), K);
+            assertTrue("on: a scan stopped early", ClusterANNStat.SCAN_EARLY_STOP.getTotal() > stopsOn);
+            assertTrue(
+                "on: fewer clusters scanned than planned",
+                ClusterANNStat.CLUSTERS_SCANNED.getTotal() - scannedOn < ClusterANNStat.PROBES_PLANNED.getTotal() - plannedOn
+            );
+        } finally {
+            EarlyStopExperiment.reset();
+            ShardPlanExperiment.reset();
+        }
+    }
+
+    private ClusterANNWeight liveWeight(final float[] query) throws IOException {
+        final ClusterANNQuery q = new ClusterANNQuery(FIELD, query, K, null, null, 0);
+        return (ClusterANNWeight) searcher.createWeight(searcher.rewrite(q), ScoreMode.COMPLETE, 1f);
     }
 
     private ClusterANNWeight weight(final float[] query, final Query filter, final ShardPlanner.Budget budget) throws IOException {

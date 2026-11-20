@@ -17,6 +17,7 @@ import org.apache.lucene.search.TimeLimitingKnnCollectorManager;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.search.join.BitSetProducer;
 import org.opensearch.common.Nullable;
+import org.opensearch.knn.clusterann.read.orchestration.ShardPlanExperiment;
 import org.opensearch.knn.clusterann.read.orchestration.ShardPlanner;
 
 import java.io.IOException;
@@ -74,9 +75,11 @@ public class ClusterANNQuery extends Query {
     private final int shardId;
 
     /**
-     * How many clusters the shard plan keeps. Internal: {@link ShardPlanner.Budget#CAPPED} for every query built through
-     * the public constructor; the uncapped rule is reachable only from this package, until scoring-time pruning lands.
+     * How many clusters the shard plan keeps, or null to read it from the live {@link ShardPlanExperiment} switches
+     * (EXPERIMENT, do not merge) when a weight is created, as every query built through the public constructor does.
+     * A non-null budget is for tests in this package.
      */
+    @Nullable
     private final ShardPlanner.Budget budget;
 
     public ClusterANNQuery(
@@ -87,7 +90,7 @@ public class ClusterANNQuery extends Query {
         @Nullable final BitSetProducer parentsFilter,
         final int shardId
     ) {
-        this(field, queryVector, candidateK, filter, parentsFilter, shardId, ShardPlanner.Budget.CAPPED);
+        this(field, queryVector, candidateK, filter, parentsFilter, shardId, null);
     }
 
     ClusterANNQuery(
@@ -99,7 +102,7 @@ public class ClusterANNQuery extends Query {
         final int shardId,
         final ShardPlanner.Budget budget
     ) {
-        this.budget = Objects.requireNonNull(budget, "budget");
+        this.budget = budget;
         this.field = field;
         this.queryVector = queryVector;
         this.candidateK = candidateK;
@@ -125,7 +128,20 @@ public class ClusterANNQuery extends Query {
             new ClusterANNCollectorManager(candidateK, parentsFilter, searcher),
             searcher.getTimeout()
         );
-        return new ClusterANNWeight(this, field, queryVector, candidateK, filterWeight(searcher), collectorManager, boost, budget);
+        // EXPERIMENT (do not merge): the live shard-plan switches, read once per weight so every segment of this query sees
+        // one consistent setting.
+        final ShardPlanExperiment.Config live = ShardPlanExperiment.current();
+        return new ClusterANNWeight(
+            this,
+            field,
+            queryVector,
+            candidateK,
+            filterWeight(searcher),
+            collectorManager,
+            boost,
+            budget == null ? live.budget() : budget,
+            live.enabled()
+        );
     }
 
     /**

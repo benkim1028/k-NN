@@ -331,6 +331,108 @@ class ShardPlannerTests {
         }
     }
 
+    // ---------------------------------------------------------------- EXPERIMENT switches (do not merge)
+
+    /**
+     * Knee off: rule H's cost cap is what each segment's own knee-off plan would probe (its ceiling, or the nearest that
+     * hold k), checked against the real per-segment planner, so the shard applies no knee anywhere.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = { false, true })
+    void testPlan_whenKneeOff_thenTheCappedBudgetHasNoKnee(final boolean filtered) throws IOException {
+        KneeExperiment.setEnabled(false);
+        try {
+            for (int seed = 0; seed < 30; seed++) {
+                final Random random = new Random(900 + seed);
+                final int k = new int[] { 1, 10, 100 }[seed % 3];
+                final List<ShardPlanner.Segment> segments = new ArrayList<>();
+                final List<Fixture> fixtures = new ArrayList<>();
+                for (int s = 0; s < 1 + random.nextInt(5); s++) {
+                    final Fixture f = fixture(
+                        random,
+                        VectorSimilarityFunction.EUCLIDEAN,
+                        5 + random.nextInt(200),
+                        4,
+                        filtered ? 0.05 + random.nextDouble() * 0.3 : 1.0
+                    );
+                    fixtures.add(f);
+                    segments.add(new ShardPlanner.Segment(f.clusters(), filtered ? f.digest() : null));
+                }
+                final float[] query = query(random, 4);
+                int today = 0;
+                for (final Fixture f : fixtures) {
+                    today += CentroidPlanner.plan(
+                        f.clusters(),
+                        query,
+                        PlanParams.of(f.clusters().numClusters()),
+                        k,
+                        filtered ? f.acceptDocs() : null,
+                        () -> {
+                            throw new AssertionError("dense");
+                        }
+                    ).length;
+                }
+                final ShardPlanner.Plan capped = ShardPlanner.plan(segments, query, k, ShardPlanner.Budget.CAPPED);
+                assertEquals(Math.min(capped.params().maxProbes(), today), capped.budget(), "seed " + seed);
+            }
+        } finally {
+            KneeExperiment.reset();
+        }
+    }
+
+    /**
+     * The benchmark's sanity point: knee off, a static probe curve (coefficient 0, intercept m), shard floor 0 and rule
+     * R. A one-segment shard then probes exactly what the baseline's per-segment knee-off plan probes, filtered or not.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = { false, true })
+    void testPlan_whenOneSegmentStaticMKneeOffRuleFloorZero_thenSameProbesAsTheBaseline(final boolean filtered) throws IOException {
+        KneeExperiment.setEnabled(false);
+        ShardPlanExperiment.set(new ShardPlanExperiment.Config(true, ShardPlanner.Budget.RULE, 0.0));
+        try {
+            for (int seed = 0; seed < 40; seed++) {
+                final int m = new int[] { 1, 2, 4, 8 }[seed % 4];
+                ProbeCurveExperiment.set(ProbeCurveExperiment.DEFAULT_CURVE.withIntercept(m).withCoefficient(0.0));
+                final Random random = new Random(1300 + seed);
+                final int k = new int[] { 1, 10, 100 }[seed % 3];
+                final Fixture f = fixture(
+                    random,
+                    VectorSimilarityFunction.EUCLIDEAN,
+                    1 + random.nextInt(400),
+                    4,
+                    filtered ? 0.01 + random.nextDouble() * 0.5 : 1.0
+                );
+                final float[] query = query(random, 4);
+                final int[] baseline = CentroidPlanner.plan(
+                    f.clusters(),
+                    query,
+                    PlanParams.of(f.clusters().numClusters()),
+                    k,
+                    filtered ? f.acceptDocs() : null,
+                    () -> {
+                        throw new AssertionError("dense");
+                    }
+                );
+                final FilterDigest digest = filtered ? f.digest() : null;
+                final ShardPlanner.Plan plan = ShardPlanner.plan(
+                    List.of(new ShardPlanner.Segment(f.clusters(), digest)),
+                    query,
+                    k,
+                    ShardPlanner.Budget.RULE
+                );
+                assertArrayEquals(
+                    baseline,
+                    CentroidPlanner.planWithin(f.clusters(), query, plan.segmentParams()[0], digest),
+                    "seed " + seed + " m " + m
+                );
+            }
+        } finally {
+            KneeExperiment.reset();
+            ShardPlanExperiment.reset();
+            ProbeCurveExperiment.reset();
+        }
+    }
+
     // ---------------------------------------------------------------- segment re-rank == shard count
 
     /**

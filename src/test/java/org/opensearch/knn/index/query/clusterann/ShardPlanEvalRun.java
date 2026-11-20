@@ -378,11 +378,16 @@ class ShardPlanEvalRun {
     }
 
     private static Weight filterWeight(final IndexSearcher searcher, final Query filter) throws IOException {
+        return filterWeight(searcher, filter, FIELD);
+    }
+
+    /** The filter conjoined with "has a vector in {@code field}", as ClusterANNQuery builds it; null when unfiltered. */
+    private static Weight filterWeight(final IndexSearcher searcher, final Query filter, final String field) throws IOException {
         if (filter == null) {
             return null;
         }
         final Query conjoined = new BooleanQuery.Builder().add(filter, BooleanClause.Occur.FILTER)
-            .add(new FieldExistsQuery(FIELD), BooleanClause.Occur.FILTER)
+            .add(new FieldExistsQuery(field), BooleanClause.Occur.FILTER)
             .build();
         return searcher.createWeight(searcher.rewrite(conjoined), ScoreMode.COMPLETE_NO_SCORES, 1f);
     }
@@ -420,7 +425,7 @@ class ShardPlanEvalRun {
                 new ClusterANNCollectorManager(k, null, searcher),
                 searcher.getTimeout()
             );
-            final Weight filterWeight = filterWeight(searcher, filter);
+            final Weight filterWeight = filterWeight(searcher, filter, field);
             return new Weight(this) {
                 @Override
                 public ScorerSupplier scorerSupplier(final LeafReaderContext context) {

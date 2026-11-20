@@ -30,6 +30,8 @@ import org.opensearch.knn.clusterann.read.orchestration.EarlyStopExperiment;
 import org.opensearch.knn.clusterann.read.orchestration.EarlyStopParams;
 import org.opensearch.knn.clusterann.read.orchestration.KneeExperiment;
 import org.opensearch.knn.clusterann.read.orchestration.ProbeCurveExperiment;
+import org.opensearch.knn.clusterann.read.orchestration.ShardPlanExperiment;
+import org.opensearch.knn.clusterann.read.orchestration.ShardPlanner;
 import org.opensearch.knn.index.engine.MemoryOptimizedSearchSupportSpec;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManagerDto;
@@ -44,6 +46,7 @@ import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -640,6 +643,80 @@ public class KNNSettings {
     }
 
     /**
+     * EXPERIMENT (do not merge): shard-budget benchmark. Dynamic cluster settings for shard-level ClusterANN planning:
+     * on/off (default on), the budget ({@code capped}, rule H, the default; or {@code rule}, rule R uncapped), and the
+     * floor on the shard ceiling's multiplier (default 8; 0 lets the live probe curve set it). Set them transient: the
+     * base jar does not know the keys.
+     */
+    public static final String KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_ENABLED = "knn.clusterann.experiment.shard_plan_enabled";
+    public static final String KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_BUDGET = "knn.clusterann.experiment.shard_plan_budget";
+    public static final String KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_MIN_MULTIPLIER = "knn.clusterann.experiment.shard_plan_min_multiplier";
+
+    public static final Setting<Boolean> KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_ENABLED_SETTING = Setting.boolSetting(
+        KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_ENABLED,
+        ShardPlanExperiment.DEFAULT_ENABLED,
+        NodeScope,
+        Dynamic
+    );
+    public static final Setting<ShardPlanner.Budget> KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_BUDGET_SETTING = new Setting<>(
+        KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_BUDGET,
+        ShardPlanExperiment.DEFAULT_BUDGET.name().toLowerCase(Locale.ROOT),
+        value -> ShardPlanExperiment.parseBudget(value, KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_BUDGET),
+        NodeScope,
+        Dynamic
+    );
+    public static final Setting<Double> KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_MIN_MULTIPLIER_SETTING = probeCurveSetting(
+        KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_MIN_MULTIPLIER,
+        ShardPlanExperiment.DEFAULT_MIN_MULTIPLIER,
+        ShardPlanExperiment.MIN_MIN_MULTIPLIER,
+        ShardPlanExperiment.MAX_MIN_MULTIPLIER
+    );
+
+    private static final List<Setting<?>> SHARD_PLAN_SETTINGS = List.of(
+        KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_ENABLED_SETTING,
+        KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_BUDGET_SETTING,
+        KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_MIN_MULTIPLIER_SETTING
+    );
+
+    /**
+     * EXPERIMENT (do not merge): shard-budget benchmark. The shard-plan switches the given settings describe; a key they
+     * leave out takes its default.
+     *
+     * @throws IllegalArgumentException if a key is set to a value outside its range
+     */
+    public static ShardPlanExperiment.Config shardPlan(final Settings settings) {
+        return new ShardPlanExperiment.Config(
+            KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_ENABLED_SETTING.get(settings),
+            KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_BUDGET_SETTING.get(settings),
+            KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_MIN_MULTIPLIER_SETTING.get(settings)
+        );
+    }
+
+    /**
+     * EXPERIMENT (do not merge): shard-budget benchmark. Seeds the live shard-plan switches and keeps them in step with
+     * every later cluster-settings update, through one grouped consumer like the probe curve's: an update that sets
+     * several keys publishes one whole config, a bad value rejects the whole update, and a caller whose
+     * {@link ClusterSettings} does not carry the keys still initializes.
+     */
+    public static void registerShardPlanExperiment(final ClusterSettings clusterSettings, final Settings nodeSettings) {
+        final boolean registered = SHARD_PLAN_SETTINGS.stream().allMatch(setting -> clusterSettings.get(setting.getKey()) == setting);
+        ShardPlanExperiment.set(
+            registered
+                ? new ShardPlanExperiment.Config(
+                    clusterSettings.get(KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_ENABLED_SETTING),
+                    clusterSettings.get(KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_BUDGET_SETTING),
+                    clusterSettings.get(KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_MIN_MULTIPLIER_SETTING)
+                )
+                : shardPlan(nodeSettings)
+        );
+        clusterSettings.addSettingsUpdateConsumer(
+            settings -> ShardPlanExperiment.set(shardPlan(settings)),
+            SHARD_PLAN_SETTINGS,
+            KNNSettings::shardPlan
+        );
+    }
+
+    /**
      * EXPERIMENT (do not merge): scan early-stop sweep. Dynamic cluster settings that turn the ClusterANN scan early
      * stop on (default off, the shipped behaviour) and set its patience (default 3), epsilon (default -1 = derived,
      * max(1, ceil(0.01 * k)); else an absolute count) and floor (default -1 = derived, the plan's minProbes; else an
@@ -1011,7 +1088,11 @@ public class KNNSettings {
             KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_ENABLED_SETTING,
             KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_PATIENCE_SETTING,
             KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_EPSILON_SETTING,
-            KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_FLOOR_SETTING
+            KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_FLOOR_SETTING,
+            // EXPERIMENT (do not merge): shard-budget benchmark
+            KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_ENABLED_SETTING,
+            KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_BUDGET_SETTING,
+            KNN_CLUSTERANN_EXPERIMENT_SHARD_PLAN_MIN_MULTIPLIER_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
@@ -1228,6 +1309,8 @@ public class KNNSettings {
         registerKneeExperiment(clusterService.getClusterSettings(), clusterService.getSettings());
         // EXPERIMENT (do not merge): scan early-stop sweep.
         registerEarlyStopExperiment(clusterService.getClusterSettings(), clusterService.getSettings());
+        // EXPERIMENT (do not merge): shard-budget benchmark.
+        registerShardPlanExperiment(clusterService.getClusterSettings(), clusterService.getSettings());
     }
 
     public static ByteSizeValue parseknnMemoryCircuitBreakerValue(String sValue, String settingName) {
