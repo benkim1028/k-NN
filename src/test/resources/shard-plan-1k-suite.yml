@@ -1,0 +1,30 @@
+# Shard-level planning against per-segment planning (ShardPlanEvalRun) on the committed 1k corpora. Opt-in:
+#
+#   ./gradlew clusterAnnTest --no-daemon --tests '*ShardPlanEvalRun' -Dknn.shardPlanEval=true \
+#     -Dknn.suite=src/test/resources/shard-plan-1k-suite.yml
+#
+# 1000 vectors is about two clusters, so this checks the path end to end more than it measures anything. Cohere only:
+# the committed SIFT and GloVe samples are LZF-chunked, and jhdf's LZF codec is not on this project's test classpath.
+
+defaults:
+  corpus:
+    type: hdf5
+    size: 1000
+    queries: 1000
+  index:
+    docsPerSegment: 1000
+    expectFiles: [clap, clac]
+  search:
+    k: 10
+    queries: 200
+    warmup: 20
+  codec:
+    name: ClusterANN1030TestCodec
+    params:
+      quantization: {encoding: DATA_BLIND_INT8, docBits: 8}
+
+scenarios:
+  - name: cohere-1k-int8
+    corpus:
+      file: https://dbyiw3u3rf9yr.cloudfront.net/corpora/vectorsearch/cohere-wikipedia-22-12-en-embeddings/documents-1k.hdf5.bz2
+      similarity: maximum_inner_product
