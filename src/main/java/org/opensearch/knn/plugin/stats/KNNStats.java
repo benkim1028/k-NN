@@ -43,6 +43,9 @@ public class KNNStats {
         ClusterANNStat.CLUSTERS_SCANNED,
         ClusterANNStat.EMPTY_PROBES_SKIPPED,
         ClusterANNStat.CENTROID_KNEE_EARLY_STOP,
+        // EXPERIMENT (do not merge): scan early stop sweep
+        ClusterANNStat.SCAN_EARLY_STOP,
+        ClusterANNStat.SCAN_EARLY_STOP_SCANNED_BPS,
         ClusterANNStat.FILTER_ELIGIBLE_CLUSTERS,
         ClusterANNStat.FILTER_EXTENDED_PAST_MAX_PROBES,
         ClusterANNStat.FILTER_SELECTIVITY_BPS,

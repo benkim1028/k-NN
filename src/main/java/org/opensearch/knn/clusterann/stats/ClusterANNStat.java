@@ -100,6 +100,17 @@ public enum ClusterANNStat {
     BLOCKS_FETCHED("clusterann_blocks_fetched"),
     EXACT_FALLBACK("clusterann_exact_fallback"),
     CENTROID_KNEE_EARLY_STOP("clusterann_centroid_knee_early_stop"),
+    /**
+     * EXPERIMENT (do not merge): scans stopped by the scan early stop (patience quiet clusters in a row) with probes
+     * still left in the plan. Recorded only while the stop is enabled.
+     */
+    SCAN_EARLY_STOP("clusterann_scan_early_stop"),
+    /**
+     * EXPERIMENT (do not merge): per segment scan with the scan early stop enabled and a non-empty plan, probes walked
+     * (empty ones included) as a fraction of probes planned, in bps; 10000 when the scan ran its whole plan. Either
+     * stop (patience or the collector's own) shortens it. {@code total / count} is the mean fraction.
+     */
+    SCAN_EARLY_STOP_SCANNED_BPS("clusterann_scan_early_stop_scanned_bps"),
 
     // ---- G. Search — filtered ----
     QUERY_WITH_FILTER_REQUESTS("clusterann_query_with_filter_requests"),

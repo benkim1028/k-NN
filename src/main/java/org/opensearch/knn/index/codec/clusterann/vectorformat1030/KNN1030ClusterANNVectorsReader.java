@@ -38,6 +38,7 @@ import org.opensearch.knn.clusterann.read.block.scalar.JavaAdcScoreComputer;
 import org.opensearch.knn.clusterann.read.block.scalar.datablind.JavaInt8ScoreComputer;
 import org.opensearch.knn.clusterann.read.orchestration.CentroidPlanner;
 import org.opensearch.knn.clusterann.read.orchestration.ClusterSearcher;
+import org.opensearch.knn.clusterann.read.orchestration.EarlyStopExperiment;
 import org.opensearch.knn.clusterann.read.orchestration.PlanParams;
 import org.opensearch.knn.clusterann.stats.ClusterANNStat;
 
@@ -358,16 +359,22 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
             float[] scanQuery = new float[query.length];
             fieldClusters.rotation().rotate(query, scanQuery);
 
-            final int scanned = ClusterSearcher.search(
+            // EXPERIMENT (do not merge): the scan early stop, read once per segment search from the live switch. Off (the
+            // default) is EarlyStopParams.OFF, which scans the whole plan exactly as before.
+            final ClusterSearcher.Result result = ClusterSearcher.search(
                 fieldClusters,
                 probes,
                 ScanParams.of(scanQuery),
+                EarlyStopExperiment.current(),
                 translatedKnnCollector,
                 acceptedOrds
             );
+            final int scanned = result.scanned();
             ClusterANNStat.CLUSTERS_SCANNED.record(scanned);
-            if (probes.length > scanned) {
-                ClusterANNStat.EMPTY_PROBES_SKIPPED.incrementBy(probes.length - scanned);
+            // Probes an early stop left unvisited were never reached, so they are not empty ones skipped.
+            final int emptySkipped = probes.length - scanned - result.unvisited();
+            if (emptySkipped > 0) {
+                ClusterANNStat.EMPTY_PROBES_SKIPPED.incrementBy(emptySkipped);
             }
             // Latency recorded only for a real IVF search (past the null-clusters guard), not the fallback path.
             // Microseconds: per-segment IVF search is frequently sub-millisecond, so milliseconds would floor most

@@ -118,8 +118,9 @@ final class ClusterANNWeight extends Weight {
             // for itself. The threshold belongs to the probed clusters' sizes, which the codec knows and this layer does
             // not, so it is left out rather than approximated with a bound that means nothing for a cluster scan.
 
-            // No visit limit: nothing in the scan path reads earlyTerminated() yet, so a limit here would be quietly
-            // ignored. Said outright rather than passed as a number that does nothing.
+            // No visit limit: the scan reads earlyTerminated() only while the EXPERIMENT scan early stop is on (where it
+            // also honours the time-limiting wrapper's timeout), so a limit here would otherwise be quietly ignored. Said
+            // outright rather than passed as a number that does nothing.
             // Null for a nested field's segment that holds no parents: there are no children to score there either, so
             // this is "nothing here", not "nothing matched".
             final KnnCollector collector = collectorManager.newCollector(Integer.MAX_VALUE, KnnSearchStrategy.Hnsw.DEFAULT, context);

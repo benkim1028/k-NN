@@ -26,6 +26,8 @@ import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.index.IndexModule;
+import org.opensearch.knn.clusterann.read.orchestration.EarlyStopExperiment;
+import org.opensearch.knn.clusterann.read.orchestration.EarlyStopParams;
 import org.opensearch.knn.clusterann.read.orchestration.KneeExperiment;
 import org.opensearch.knn.clusterann.read.orchestration.ProbeCurveExperiment;
 import org.opensearch.knn.index.engine.MemoryOptimizedSearchSupportSpec;
@@ -638,6 +640,100 @@ public class KNNSettings {
     }
 
     /**
+     * EXPERIMENT (do not merge): scan early-stop sweep. Dynamic cluster settings that turn the ClusterANN scan early
+     * stop on (default off, the shipped behaviour) and set its patience (default 3), epsilon (default -1 = derived,
+     * max(1, ceil(0.01 * k)); else an absolute count) and floor (default -1 = derived, the plan's minProbes; else an
+     * absolute cluster count). Set them transient: the base jar does not know the keys.
+     */
+    public static final String KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_ENABLED = "knn.clusterann.experiment.early_stop_enabled";
+    public static final String KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_PATIENCE = "knn.clusterann.experiment.early_stop_patience";
+    public static final String KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_EPSILON = "knn.clusterann.experiment.early_stop_epsilon";
+    public static final String KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_FLOOR = "knn.clusterann.experiment.early_stop_floor";
+
+    public static final Setting<Boolean> KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_ENABLED_SETTING = Setting.boolSetting(
+        KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_ENABLED,
+        EarlyStopExperiment.DEFAULT_ENABLED,
+        NodeScope,
+        Dynamic
+    );
+    public static final Setting<Integer> KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_PATIENCE_SETTING = Setting.intSetting(
+        KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_PATIENCE,
+        EarlyStopExperiment.DEFAULT_PATIENCE,
+        EarlyStopExperiment.MIN_PATIENCE,
+        EarlyStopExperiment.MAX_PATIENCE,
+        NodeScope,
+        Dynamic
+    );
+    /** -1 (derived) or an absolute count in [1, max]; 0 is refused by the setting itself, so it fails as a settings error. */
+    public static final Setting<Integer> KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_EPSILON_SETTING = new Setting<>(
+        KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_EPSILON,
+        Integer.toString(EarlyStopExperiment.DEFAULT_EPSILON),
+        value -> EarlyStopExperiment.parseEpsilon(value, KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_EPSILON),
+        NodeScope,
+        Dynamic
+    );
+    public static final Setting<Integer> KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_FLOOR_SETTING = Setting.intSetting(
+        KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_FLOOR,
+        EarlyStopExperiment.DEFAULT_FLOOR,
+        EarlyStopExperiment.MIN_FLOOR,
+        EarlyStopExperiment.MAX_FLOOR,
+        NodeScope,
+        Dynamic
+    );
+
+    private static final List<Setting<?>> EARLY_STOP_SETTINGS = List.of(
+        KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_ENABLED_SETTING,
+        KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_PATIENCE_SETTING,
+        KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_EPSILON_SETTING,
+        KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_FLOOR_SETTING
+    );
+
+    /**
+     * EXPERIMENT (do not merge): scan early-stop sweep. The early stop the given settings describe; a key they leave out
+     * takes its default, so empty settings give {@code EarlyStopParams.OFF}.
+     *
+     * @param settings the settings to read the four keys from
+     * @throws IllegalArgumentException if a key is out of its range, or epsilon is 0
+     */
+    public static EarlyStopParams earlyStop(final Settings settings) {
+        return EarlyStopExperiment.of(
+            KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_ENABLED_SETTING.get(settings),
+            KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_PATIENCE_SETTING.get(settings),
+            KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_EPSILON_SETTING.get(settings),
+            KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_FLOOR_SETTING.get(settings)
+        );
+    }
+
+    /**
+     * EXPERIMENT (do not merge): scan early-stop sweep. Seeds the live early stop from the node's settings and keeps it
+     * in step with every later cluster-settings update. One grouped consumer over the four keys, like the probe curve's:
+     * an update publishes one whole {@link EarlyStopParams}, its validator builds it before anything is applied (so a bad
+     * value rejects the whole update and leaves the live one as it was), and a caller whose {@link ClusterSettings} does
+     * not carry the keys still initializes.
+     *
+     * @param clusterSettings the node's cluster settings
+     * @param nodeSettings the node's startup settings, which the stop is seeded from when the keys are not registered
+     */
+    public static void registerEarlyStopExperiment(final ClusterSettings clusterSettings, final Settings nodeSettings) {
+        final boolean registered = EARLY_STOP_SETTINGS.stream().allMatch(setting -> clusterSettings.get(setting.getKey()) == setting);
+        EarlyStopExperiment.set(
+            registered
+                ? EarlyStopExperiment.of(
+                    clusterSettings.get(KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_ENABLED_SETTING),
+                    clusterSettings.get(KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_PATIENCE_SETTING),
+                    clusterSettings.get(KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_EPSILON_SETTING),
+                    clusterSettings.get(KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_FLOOR_SETTING)
+                )
+                : earlyStop(nodeSettings)
+        );
+        clusterSettings.addSettingsUpdateConsumer(
+            settings -> EarlyStopExperiment.set(earlyStop(settings)),
+            EARLY_STOP_SETTINGS,
+            KNNSettings::earlyStop
+        );
+    }
+
+    /**
      * Keystore settings for build service HTTP authorization
      */
     public static final Setting<SecureString> KNN_REMOTE_BUILD_SERVER_USERNAME_SETTING = SecureSetting.secureString(
@@ -910,7 +1006,12 @@ public class KNNSettings {
             KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_EXPONENT_SETTING,
             KNN_CLUSTERANN_EXPERIMENT_PROBE_CURVE_CAP_SETTING,
             // EXPERIMENT (do not merge): static-multiplier sweep
-            KNN_CLUSTERANN_EXPERIMENT_KNEE_ENABLED_SETTING
+            KNN_CLUSTERANN_EXPERIMENT_KNEE_ENABLED_SETTING,
+            // EXPERIMENT (do not merge): scan early-stop sweep
+            KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_ENABLED_SETTING,
+            KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_PATIENCE_SETTING,
+            KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_EPSILON_SETTING,
+            KNN_CLUSTERANN_EXPERIMENT_EARLY_STOP_FLOOR_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
@@ -1125,6 +1226,8 @@ public class KNNSettings {
         registerProbeCurveExperiment(clusterService.getClusterSettings(), clusterService.getSettings());
         // EXPERIMENT (do not merge): static-multiplier sweep.
         registerKneeExperiment(clusterService.getClusterSettings(), clusterService.getSettings());
+        // EXPERIMENT (do not merge): scan early-stop sweep.
+        registerEarlyStopExperiment(clusterService.getClusterSettings(), clusterService.getSettings());
     }
 
     public static ByteSizeValue parseknnMemoryCircuitBreakerValue(String sValue, String settingName) {
