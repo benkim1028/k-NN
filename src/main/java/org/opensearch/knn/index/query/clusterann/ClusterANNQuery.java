@@ -17,13 +17,15 @@ import org.apache.lucene.search.TimeLimitingKnnCollectorManager;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.search.join.BitSetProducer;
 import org.opensearch.common.Nullable;
+import org.opensearch.knn.clusterann.read.orchestration.ShardPlanner;
 
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Objects;
 
 /**
- * Searches a ClusterANN field, one segment at a time, through the codec's own reader.
+ * Searches a ClusterANN field, one segment at a time, through the codec's own reader, within a probe budget planned once
+ * for the whole shard (see {@link ClusterANNWeight}).
  *
  * <p><b>Not a {@code KnnFloatVectorQuery} subclass, on purpose.</b> Lucene's {@code AbstractKnnVectorQuery} brings four
  * behaviours, of which this wants one and wants it differently:
@@ -71,6 +73,12 @@ public class ClusterANNQuery extends Query {
     /** Only for logging; a query has no business knowing which shard it is on. */
     private final int shardId;
 
+    /**
+     * How many clusters the shard plan keeps. Internal: {@link ShardPlanner.Budget#CAPPED} for every query built through
+     * the public constructor; the uncapped rule is reachable only from this package, until scoring-time pruning lands.
+     */
+    private final ShardPlanner.Budget budget;
+
     public ClusterANNQuery(
         final String field,
         final float[] queryVector,
@@ -79,6 +87,19 @@ public class ClusterANNQuery extends Query {
         @Nullable final BitSetProducer parentsFilter,
         final int shardId
     ) {
+        this(field, queryVector, candidateK, filter, parentsFilter, shardId, ShardPlanner.Budget.CAPPED);
+    }
+
+    ClusterANNQuery(
+        final String field,
+        final float[] queryVector,
+        final int candidateK,
+        @Nullable final Query filter,
+        @Nullable final BitSetProducer parentsFilter,
+        final int shardId,
+        final ShardPlanner.Budget budget
+    ) {
+        this.budget = Objects.requireNonNull(budget, "budget");
         this.field = field;
         this.queryVector = queryVector;
         this.candidateK = candidateK;
@@ -104,7 +125,7 @@ public class ClusterANNQuery extends Query {
             new ClusterANNCollectorManager(candidateK, parentsFilter, searcher),
             searcher.getTimeout()
         );
-        return new ClusterANNWeight(this, field, queryVector, candidateK, filterWeight(searcher), collectorManager, boost);
+        return new ClusterANNWeight(this, field, queryVector, candidateK, filterWeight(searcher), collectorManager, boost, budget);
     }
 
     /**
@@ -154,6 +175,8 @@ public class ClusterANNQuery extends Query {
             + filter
             + ", shardId="
             + shardId
+            + ", budget="
+            + budget
             + "]";
     }
 
@@ -164,6 +187,7 @@ public class ClusterANNQuery extends Query {
         }
         final ClusterANNQuery o = (ClusterANNQuery) other;
         return candidateK == o.candidateK
+            && budget == o.budget
             && Objects.equals(field, o.field)
             && Arrays.equals(queryVector, o.queryVector)
             && Objects.equals(filter, o.filter)
@@ -172,6 +196,6 @@ public class ClusterANNQuery extends Query {
 
     @Override
     public int hashCode() {
-        return Objects.hash(field, Arrays.hashCode(queryVector), candidateK, filter, parentsFilter);
+        return Objects.hash(field, Arrays.hashCode(queryVector), candidateK, filter, parentsFilter, budget);
     }
 }

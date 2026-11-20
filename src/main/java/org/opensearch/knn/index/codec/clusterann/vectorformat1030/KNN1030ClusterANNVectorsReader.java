@@ -17,6 +17,7 @@ import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.internal.hppc.IntObjectHashMap;
@@ -25,6 +26,7 @@ import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.IOSupplier;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.hnsw.OrdinalTranslatedKnnCollector;
@@ -39,7 +41,10 @@ import org.opensearch.knn.clusterann.read.block.scalar.datablind.JavaInt8ScoreCo
 import org.opensearch.knn.clusterann.read.orchestration.CentroidPlanner;
 import org.opensearch.knn.clusterann.read.orchestration.ClusterSearcher;
 import org.opensearch.knn.clusterann.read.orchestration.EarlyStopExperiment;
+import org.opensearch.knn.clusterann.read.orchestration.FilterDigest;
 import org.opensearch.knn.clusterann.read.orchestration.PlanParams;
+import org.opensearch.knn.clusterann.read.orchestration.ShardPlanStrategy;
+import org.opensearch.knn.clusterann.read.orchestration.ShardPlanner;
 import org.opensearch.knn.clusterann.stats.ClusterANNStat;
 
 import java.io.IOException;
@@ -333,15 +338,7 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
             );
             final Bits acceptedOrds = buildAcceptedOrds(acceptDocs, ordToDoc, fieldClusters.numVectors());
 
-            // Like ordToDoc, the docs-with-field set sits at absolute offsets in the whole .clap.
-            final int[] probes = CentroidPlanner.plan(
-                fieldClusters,
-                query,
-                PlanParams.of(fieldClusters.numClusters()),
-                knnCollector.k(),
-                acceptDocs,
-                () -> IndexedDISI.asDocIndexIterator(ordToDocConfig.getIndexedDISI(postings))
-            );
+            final int[] probes = probes(fieldClusters, query, knnCollector, acceptDocs);
 
             ClusterANNStat.PROBES_PLANNED.record(probes.length);
             if (filtered) {
@@ -384,6 +381,58 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
             ClusterANNStat.QUERY_ERRORS.increment();
             throw e;
         }
+    }
+
+    /**
+     * The clusters to scan: a shard's plan when the collector carries one, which the reader scans exactly as given;
+     * otherwise this segment's own plan. Only a caller searching this reader without a shard plan (a direct
+     * {@code searchNearestVectors}, or a test) gets the per-segment plan.
+     */
+    private int[] probes(final Clusters fieldClusters, final float[] query, final KnnCollector knnCollector, final AcceptDocs acceptDocs)
+        throws IOException {
+        if (knnCollector.getSearchStrategy() instanceof ShardPlanStrategy planned) {
+            if (!planned.plannedFor(fieldClusters)) {
+                throw new IllegalArgumentException("shard plan was made for another segment or field than this one");
+            }
+            final int[] probes = planned.probes();
+            for (final int probe : probes) {
+                if (probe < 0 || probe >= fieldClusters.numClusters()) {
+                    throw new IllegalArgumentException(
+                        "shard plan names cluster " + probe + ", outside [0, " + fieldClusters.numClusters() + ")"
+                    );
+                }
+            }
+            return probes;
+        }
+        // Like ordToDoc, the docs-with-field set sits at absolute offsets in the whole .clap.
+        return CentroidPlanner.plan(
+            fieldClusters,
+            query,
+            PlanParams.of(fieldClusters.numClusters()),
+            knnCollector.k(),
+            acceptDocs,
+            vectorDocsSupplier(fieldClusters)
+        );
+    }
+
+    private IOSupplier<KnnVectorValues.DocIndexIterator> vectorDocsSupplier(final Clusters fieldClusters) {
+        final OrdToDocDISIReaderConfiguration ordToDocConfig = fieldClusters.clusterMeta().ordToDoc();
+        return () -> IndexedDISI.asDocIndexIterator(ordToDocConfig.getIndexedDISI(postings));
+    }
+
+    /**
+     * This segment's input to a shard plan for {@code fieldName}: its clusters and what {@code acceptDocs} leaves of
+     * them. Walks the filter's accepted documents once; the caller passes the same {@code acceptDocs} to the search so
+     * the filter is not evaluated twice.
+     *
+     * @return {@code null} when this segment has no clusters for the field, so a search here returns nothing
+     */
+    public ShardPlanner.Segment shardPlanSegment(final String fieldName, final AcceptDocs acceptDocs) throws IOException {
+        final Clusters fieldClusters = clusters(fieldName);
+        if (fieldClusters == null || fieldClusters.numClusters() == 0) {
+            return null;
+        }
+        return new ShardPlanner.Segment(fieldClusters, FilterDigest.of(fieldClusters, acceptDocs, vectorDocsSupplier(fieldClusters)));
     }
 
     private Bits buildAcceptedOrds(AcceptDocs acceptDocs, LongValues ordToDoc, int numVectors) throws IOException {

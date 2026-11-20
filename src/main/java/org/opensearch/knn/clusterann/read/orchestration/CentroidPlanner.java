@@ -8,11 +8,9 @@ package org.opensearch.knn.clusterann.read.orchestration;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.AcceptDocs;
-import org.apache.lucene.search.ConjunctionUtils;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.IOSupplier;
-import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.hnsw.NeighborQueue;
 import org.opensearch.knn.clusterann.read.CentroidVectorValues;
@@ -21,7 +19,6 @@ import org.opensearch.knn.clusterann.stats.ClusterANNStat;
 
 import java.io.IOException;
 import java.util.Arrays;
-import java.util.List;
 
 /**
  * Chooses which clusters a query should visit.
@@ -82,32 +79,11 @@ public final class CentroidPlanner {
             return plan(clusters, query, params);
         }
 
-        final LongValues ordToCentroid = clusters.ordToCentroid();
-        final FixedBitSet acceptedCentroids = new FixedBitSet(clusters.numClusters());
-        final int[] acceptedCountsPerCluster = new int[clusters.numClusters()];
-        final DocIdSetIterator acceptedDocs = acceptDocs.iterator();
-        int acceptedVectors = 0;
-        if (clusters.hasDenseVectorValues()) {
-            for (int doc = acceptedDocs.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = acceptedDocs.nextDoc()) {
-                final int centroid = (int) ordToCentroid.get(doc);
-                acceptedCentroids.set(centroid);
-                acceptedCountsPerCluster[centroid]++;
-                acceptedVectors++;
-            }
-        } else {
-            final KnnVectorValues.DocIndexIterator vectorDocs = vectorDocsSupplier.get();
-            final DocIdSetIterator acceptedVectorDocs = ConjunctionUtils.intersectIterators(List.of(acceptedDocs, vectorDocs));
-            while (acceptedVectorDocs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
-                final int centroid = (int) ordToCentroid.get(vectorDocs.index());
-                acceptedCentroids.set(centroid);
-                acceptedCountsPerCluster[centroid]++;
-                acceptedVectors++;
-            }
-        }
-        final int eligibleClusters = acceptedCentroids.cardinality();
-        // True count of clusters containing at least one accepted doc (the filter's eligible set), recorded here
-        // where it is known — distinct from the planned probe count the reader records as PROBES_PLANNED.
-        ClusterANNStat.FILTER_ELIGIBLE_CLUSTERS.record(eligibleClusters);
+        final FilterDigest digest = FilterDigest.of(clusters, acceptDocs, vectorDocsSupplier);
+        final FixedBitSet acceptedCentroids = digest.eligible();
+        final int[] acceptedCountsPerCluster = digest.acceptedPerCluster();
+        final int acceptedVectors = digest.accepted();
+        final int eligibleClusters = digest.eligibleClusters();
         if (eligibleClusters == 0) {
             return NO_PROBES;
         }
@@ -141,6 +117,87 @@ public final class CentroidPlanner {
             return NO_PROBES;
         }
         return closestFirstPruned(rank(clusters, query, params.maxProbes(), null, null, 0), params.minProbes(), 1.0, null, 0);
+    }
+
+    /**
+     * One field's clusters ranked against a query, closest first, with the planner's own distance-like keys (smaller
+     * is closer). Keys are only comparable across segments because they are computed from each segment's
+     * full-precision, input-space centroids and the raw query, never from rotated centroids or quantized scores.
+     *
+     * @param ords centroid ordinals, closest first
+     * @param keys each ordinal's key, ascending
+     */
+    public record Ranked(int[] ords, float[] keys) {
+        public int size() {
+            return ords.length;
+        }
+    }
+
+    /**
+     * {@link #rank} drained closest-first. With a digest, the ranking considers only eligible clusters and keeps the
+     * nearest that fill {@code cap} and hold {@code k} accepted vectors, which may be more than {@code cap}.
+     *
+     * @param digest the filter's digest, or null when nothing is filtered out
+     */
+    static Ranked rankClosestFirst(Clusters clusters, float[] query, int cap, FilterDigest digest, int k) throws IOException {
+        final NeighborQueue nearest = digest == null
+            ? rank(clusters, query, Math.max(1, cap), null, null, 0)
+            : rank(clusters, query, Math.max(1, cap), digest.eligible(), digest.acceptedPerCluster(), k);
+        final int n = nearest.size();
+        final int[] ords = new int[n];
+        final float[] keys = new float[n];
+        for (int i = n - 1; i >= 0; i--) {
+            keys[i] = nearest.topScore();
+            ords[i] = nearest.pop();
+        }
+        return new Ranked(ords, keys);
+    }
+
+    /**
+     * The ranking heap capacity that {@link #plan(Clusters, float[], PlanParams, int, AcceptDocs, IOSupplier)} sweeps
+     * this field with under {@code PlanParams.of(numClusters)}: what a ranking must cover for
+     * {@link #segmentPlanLength} to read the segment's own plan off it.
+     */
+    static int segmentRankCap(Clusters clusters, FilterDigest digest, int k) {
+        final PlanParams params = PlanParams.of(clusters.numClusters());
+        if (digest == null) {
+            return params.maxProbes();
+        }
+        if (digest.eligibleClusters() == 0) {
+            return 0;
+        }
+        if (digest.accepted() <= k) {
+            return digest.eligibleClusters();
+        }
+        final double selectivity = digest.selectivity(clusters.numVectors());
+        return Math.max(PlanParams.forSelectivity(clusters.numClusters(), selectivity).maxProbes(), params.maxProbes());
+    }
+
+    /**
+     * How many clusters this segment's own plan, under {@code PlanParams.of(numClusters)}, would probe for the query
+     * that produced {@code ranked}. Read off an existing ranking, so it costs only the knee: {@code ranked} must have
+     * been swept with at least {@link #segmentRankCap} (and, under a filter, holding {@code k}), which makes the
+     * segment's own ranking a prefix of it.
+     */
+    static int segmentPlanLength(Clusters clusters, Ranked ranked, FilterDigest digest, int k) {
+        final PlanParams params = PlanParams.of(clusters.numClusters());
+        if (digest == null) {
+            final int length = Math.min(params.maxProbes(), ranked.size());
+            return CentroidKneePruner.prune(Arrays.copyOf(ranked.keys(), length), params.minProbes(), 1.0);
+        }
+        if (digest.eligibleClusters() == 0) {
+            return 0;
+        }
+        if (digest.accepted() <= k) {
+            return digest.eligibleClusters();
+        }
+        final int holding = holdingK(ranked.ords(), 0, digest.acceptedPerCluster(), k);
+        final int length = Math.max(Math.min(segmentRankCap(clusters, digest, k), ranked.size()), holding);
+        if (holding == length) {
+            return length;
+        }
+        final double selectivity = digest.selectivity(clusters.numVectors());
+        return Math.max(CentroidKneePruner.prune(Arrays.copyOf(ranked.keys(), length), params.minProbes(), selectivity), holding);
     }
 
     /**
