@@ -164,7 +164,9 @@ public final class ShardPlanner {
             if (budget == Budget.CAPPED) {
                 cap = Math.max(cap, CentroidPlanner.segmentRankCap(clusters, digest, k));
             }
-            ranked[s] = CentroidPlanner.rankClosestFirst(clusters, query, cap, digest, k);
+            // In a filtered shard a segment with nothing filtered out (no deletions) must hold k on its own too, or the
+            // hold could run its list dry and take farther clusters elsewhere; it counts each cluster at full size.
+            ranked[s] = CentroidPlanner.rankClosestFirst(clusters, query, cap, digest, k, filtered);
         }
 
         // 2. X.

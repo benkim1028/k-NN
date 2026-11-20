@@ -401,12 +401,11 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
             }
             // Scoring-time pruning hook: the scan may stop early within [segmentParams.minProbes(),
             // segmentParams.maxProbes()], reading planned.shardParams() for the shard's bounds. Not implemented here.
-            return CentroidPlanner.planWithin(
-                fieldClusters,
-                query,
-                segmentParams,
-                FilterDigest.of(fieldClusters, acceptDocs, vectorDocsSupplier(fieldClusters))
-            );
+            // The shard's digest of this segment's filter when it carries one; otherwise the same digest, computed here.
+            final FilterDigest digest = planned.digest() != null || acceptDocs.bits() == null
+                ? planned.digest()
+                : FilterDigest.of(fieldClusters, acceptDocs, vectorDocsSupplier(fieldClusters));
+            return CentroidPlanner.planWithin(fieldClusters, query, segmentParams, digest);
         }
         // Like ordToDoc, the docs-with-field set sits at absolute offsets in the whole .clap.
         return CentroidPlanner.plan(
@@ -426,8 +425,8 @@ public class KNN1030ClusterANNVectorsReader extends KnnVectorsReader {
 
     /**
      * This segment's input to a shard plan for {@code fieldName}: its clusters and what {@code acceptDocs} leaves of
-     * them. Walks the filter's accepted documents once; the caller passes the same {@code acceptDocs} to the search so
-     * the filter is not evaluated twice.
+     * them. Walks the filter's accepted documents once; the caller passes the same {@code acceptDocs} to the search, and
+     * the digest back on the {@link ShardPlanStrategy}, so neither the filter nor the walk is repeated.
      *
      * @return {@code null} when this segment has no clusters for the field, so a search here returns nothing
      */

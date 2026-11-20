@@ -17,15 +17,19 @@ import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.AcceptDocs;
+import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.search.QueryVisitor;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TimeLimitingKnnCollectorManager;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopKnnCollector;
+import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.util.LuceneTestCase;
 import org.opensearch.knn.clusterann.read.Clusters;
@@ -44,6 +48,8 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * The shard plan through the real reader and weight: the plan's counts reach the reader on the collector, the reader
@@ -109,7 +115,7 @@ public class ClusterANNShardPlanTests extends LuceneTestCase {
     /** Lucene's collector decorators (time limit, shared threshold) forward the strategy the weight built with. */
     public void testStrategy_reachesTheReaderThroughTheCollectorChain() throws IOException {
         final LeafReaderContext leaf = reader.leaves().get(0);
-        final ShardPlanStrategy strategy = new ShardPlanStrategy(clusters(leaf), new PlanParams(1, 3), new PlanParams(10, 72));
+        final ShardPlanStrategy strategy = new ShardPlanStrategy(clusters(leaf), new PlanParams(1, 3), new PlanParams(10, 72), null);
         final TimeLimitingKnnCollectorManager manager = new TimeLimitingKnnCollectorManager(
             new ClusterANNCollectorManager(K, null, searcher),
             null
@@ -163,7 +169,7 @@ public class ClusterANNShardPlanTests extends LuceneTestCase {
                 final TopKnnCollector planned = new TopKnnCollector(
                     K,
                     Integer.MAX_VALUE,
-                    new ShardPlanStrategy(clusters, segmentParams, new PlanParams(10, 72))
+                    new ShardPlanStrategy(clusters, segmentParams, new PlanParams(10, 72), null)
                 );
                 vectors.search(FIELD, query, planned, acceptDocs);
 
@@ -185,7 +191,7 @@ public class ClusterANNShardPlanTests extends LuceneTestCase {
         final KnnCollector collector = new TopKnnCollector(
             K,
             Integer.MAX_VALUE,
-            new ShardPlanStrategy(clusters(reader.leaves().get(1)), new PlanParams(0, 2), new PlanParams(10, 72))
+            new ShardPlanStrategy(clusters(reader.leaves().get(1)), new PlanParams(0, 2), new PlanParams(10, 72), null)
         );
         final LeafReaderContext leaf = reader.leaves().get(0);
         expectThrows(
@@ -231,6 +237,93 @@ public class ClusterANNShardPlanTests extends LuceneTestCase {
         final ShardPlanner.Plan rule = weight(query, null, ShardPlanner.Budget.RULE).shardPlan(reader.leaves().get(0)).plan();
         assertEquals(rule.params().maxProbes(), rule.probeCount());
         assertTrue(capped.probeCount() <= rule.probeCount());
+    }
+
+    /** Concurrent segment search, one leaf per slice: every leaf waits on one plan, and the hits are the sequential ones. */
+    public void testConcurrentSearch_sameHitsAsSequential() throws Exception {
+        final ExecutorService executor = Executors.newFixedThreadPool(SEGMENT_SIZES.length);
+        try {
+            final IndexSearcher concurrent = perLeafSlices(executor);
+            for (int q = 0; q < 10; q++) {
+                for (final Query filter : new Query[] { null, new TermQuery(new Term(PARITY, "odd")) }) {
+                    final ClusterANNQuery query = new ClusterANNQuery(FIELD, query(100 + q), K, filter, null, 0);
+                    assertSameHits("query " + q, searcher.search(query, K), concurrent.search(query, K));
+                }
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    /**
+     * A planning failure reaches the caller as itself. Every leaf shares the plan, so every waiting leaf sees the same
+     * failure; rethrowing one instance from several tasks makes Lucene's result merge fail on self-suppression
+     * instead.
+     */
+    public void testConcurrentSearch_whenPlanningFails_thenTheCauseSurfaces() throws Exception {
+        final ExecutorService executor = Executors.newFixedThreadPool(SEGMENT_SIZES.length);
+        try {
+            final IndexSearcher concurrent = perLeafSlices(executor);
+            for (int attempt = 0; attempt < 20; attempt++) {
+                final ClusterANNQuery query = new ClusterANNQuery(FIELD, query(7), K, new FailingQuery(), null, 0);
+                final IOException e = expectThrows(IOException.class, () -> concurrent.search(query, K));
+                assertEquals("boom", e.getMessage());
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    private IndexSearcher perLeafSlices(final ExecutorService executor) {
+        final IndexSearcher concurrent = new IndexSearcher(reader, executor) {
+            @Override
+            protected LeafSlice[] slices(final List<LeafReaderContext> leaves) {
+                return IndexSearcher.slices(leaves, 1, 1, false);
+            }
+        };
+        concurrent.setQueryCache(null);
+        return concurrent;
+    }
+
+    /** A filter whose every segment fails to produce a scorer. */
+    private static final class FailingQuery extends Query {
+        @Override
+        public Weight createWeight(final IndexSearcher searcher, final ScoreMode scoreMode, final float boost) {
+            return new Weight(this) {
+                @Override
+                public ScorerSupplier scorerSupplier(final LeafReaderContext context) throws IOException {
+                    throw new IOException("boom");
+                }
+
+                @Override
+                public Explanation explain(final LeafReaderContext context, final int doc) {
+                    return Explanation.noMatch("fails");
+                }
+
+                @Override
+                public boolean isCacheable(final LeafReaderContext ctx) {
+                    return false;
+                }
+            };
+        }
+
+        @Override
+        public String toString(final String field) {
+            return "FailingQuery";
+        }
+
+        @Override
+        public void visit(final QueryVisitor visitor) {}
+
+        @Override
+        public boolean equals(final Object other) {
+            return sameClassAs(other);
+        }
+
+        @Override
+        public int hashCode() {
+            return classHash();
+        }
     }
 
     private ClusterANNWeight weight(final float[] query, final Query filter, final ShardPlanner.Budget budget) throws IOException {

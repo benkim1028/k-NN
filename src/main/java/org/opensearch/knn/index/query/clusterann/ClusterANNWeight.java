@@ -193,6 +193,13 @@ final class ClusterANNWeight extends Weight {
         } catch (InterruptedException e) {
             throw new ThreadInterruptedException(e);
         } catch (ExecutionException e) {
+            if (existing != null) {
+                // The plan failed on the segment that made it. Rethrowing that one exception from every waiting segment
+                // would hand Lucene's result merge the same instance twice, which it cannot suppress into itself (it
+                // fails with "Self-suppression not permitted" and hides the cause). Plan again, uncached, so this segment
+                // fails with an exception of its own, or succeeds if the cause has cleared.
+                return planShard(top.leaves());
+            }
             final Throwable cause = e.getCause();
             if (cause instanceof IOException io) {
                 throw io;
@@ -237,7 +244,7 @@ final class ClusterANNWeight extends Weight {
             final PlanParams segmentParams = plan.segmentParams()[i];
             final ShardPlanStrategy strategy = segmentParams.maxProbes() == 0
                 ? null
-                : new ShardPlanStrategy(segments.get(i).clusters(), segmentParams, plan.params());
+                : new ShardPlanStrategy(segments.get(i).clusters(), segmentParams, plan.params(), segments.get(i).digest());
             byOrd[planned.get(i).ord] = new LeafPlan(plannedAcceptDocs.get(i), strategy);
         }
         return new LeafPlans(byOrd, plan);

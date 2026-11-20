@@ -159,9 +159,24 @@ public final class CentroidPlanner {
      * @param digest the filter's digest, or null when nothing is filtered out
      */
     static Ranked rankClosestFirst(Clusters clusters, float[] query, int cap, FilterDigest digest, int k) throws IOException {
-        final NeighborQueue nearest = digest == null
-            ? rank(clusters, query, Math.max(1, cap), null, null, 0)
-            : rank(clusters, query, Math.max(1, cap), digest.eligible(), digest.acceptedPerCluster(), k);
+        return rankClosestFirst(clusters, query, cap, digest, k, false);
+    }
+
+    /**
+     * As {@link #rankClosestFirst(Clusters, float[], int, FilterDigest, int)}; with {@code holdBySize} and no digest,
+     * the ranking also holds {@code k} counting each cluster at its full size, for a segment with nothing filtered out
+     * inside a shard whose cut must hold {@code k}. Still a prefix of the same order, so a re-rank keeps agreeing.
+     */
+    static Ranked rankClosestFirst(Clusters clusters, float[] query, int cap, FilterDigest digest, int k, boolean holdBySize)
+        throws IOException {
+        final NeighborQueue nearest;
+        if (digest != null) {
+            nearest = rank(clusters, query, Math.max(1, cap), digest.eligible(), digest.acceptedPerCluster(), k);
+        } else if (holdBySize) {
+            nearest = rank(clusters, query, Math.max(1, cap), null, clusters.clusterMeta().clusterSizes(), k);
+        } else {
+            nearest = rank(clusters, query, Math.max(1, cap), null, null, 0);
+        }
         final int n = nearest.size();
         final int[] ords = new int[n];
         final float[] keys = new float[n];

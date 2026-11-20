@@ -223,6 +223,63 @@ class ShardPlannerTests {
         }
     }
 
+    /**
+     * A filtered shard with an undigested segment (nothing filtered out there) of many small clusters: the cut must hold
+     * k through that segment's own ranking rather than run its list dry, so the shard holds min(k, available), and the
+     * segments' re-ranks still probe exactly what was counted.
+     */
+    @Test
+    void testPlan_whenFilteredShardMixesAnUndigestedSegment_thenTheCutStillHoldsK() throws IOException {
+        final Random random = new Random(42);
+        final Fixture small = fixture(random, VectorSimilarityFunction.EUCLIDEAN, 300, 4, 1.0);
+        final Fixture filtered = fixture(random, VectorSimilarityFunction.EUCLIDEAN, 60, 4, 0.5);
+        final List<ShardPlanner.Segment> segments = List.of(
+            new ShardPlanner.Segment(small.clusters(), null),
+            new ShardPlanner.Segment(filtered.clusters(), filtered.digest())
+        );
+        final long available = small.clusters().numVectors() + filtered.digest().accepted();
+        final float[] query = query(random, 4);
+        for (final int k : new int[] { 1000, 3000, (int) available - 1 }) {
+            final ShardPlanner.Ranked planned = ShardPlanner.planRanked(segments, query, k, ShardPlanner.Budget.RULE);
+            final PlanParams[] params = planned.plan().segmentParams();
+            long held = 0;
+            for (int i = 0; i < params[0].maxProbes(); i++) {
+                held += small.clusters().clusterSize(planned.rankings()[0].ords()[i]);
+            }
+            for (int i = 0; i < params[1].maxProbes(); i++) {
+                held += filtered.digest().acceptedPerCluster()[planned.rankings()[1].ords()[i]];
+            }
+            assertTrue(held >= Math.min(k, available), "k=" + k + ": held " + held + " of " + available);
+            // The cut is a global prefix: nothing it left out, in either segment, is closer than something it took.
+            float farthestTaken = Float.NEGATIVE_INFINITY;
+            float closestLeft = Float.POSITIVE_INFINITY;
+            for (int s = 0; s < 2; s++) {
+                final Clusters clusters = segments.get(s).clusters();
+                final CentroidPlanner.Ranked all = CentroidPlanner.rankClosestFirst(
+                    clusters,
+                    query,
+                    clusters.numClusters(),
+                    segments.get(s).digest(),
+                    0
+                );
+                if (params[s].maxProbes() > 0) {
+                    farthestTaken = Math.max(farthestTaken, all.keys()[params[s].maxProbes() - 1]);
+                }
+                if (params[s].maxProbes() < all.size()) {
+                    closestLeft = Math.min(closestLeft, all.keys()[params[s].maxProbes()]);
+                }
+            }
+            assertTrue(farthestTaken <= closestLeft, "k=" + k + ": took " + farthestTaken + " but left " + closestLeft);
+            for (int s = 0; s < 2; s++) {
+                final int[] counted = Arrays.copyOf(planned.rankings()[s].ords(), params[s].maxProbes());
+                assertArrayEquals(
+                    counted,
+                    CentroidPlanner.planWithin(segments.get(s).clusters(), query, params[s], segments.get(s).digest())
+                );
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- X policy
 
     /**
@@ -303,7 +360,8 @@ class ShardPlannerTests {
                     filtered ? 0.01 + random.nextDouble() * 0.2 : 1.0,
                     shared
                 );
-                segments.add(new ShardPlanner.Segment(f.clusters(), filtered ? f.digest() : null));
+                // Filtered shards mix in segments with nothing filtered out (no digest), as deletions in some do.
+                segments.add(new ShardPlanner.Segment(f.clusters(), filtered && (s == 0 || random.nextBoolean()) ? f.digest() : null));
             }
             final float[] query = random.nextBoolean() ? shared[0].clone() : query(random, 3);
             for (final ShardPlanner.Budget budget : ShardPlanner.Budget.values()) {
